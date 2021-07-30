@@ -2,8 +2,8 @@ import pandas as pd
 import re
 
 
-# Version 1.0
-# Last modified 2021/07/16
+# Version 2.0
+# Last modified 2021/07/30
 # Christian M. Zmasek
 
 class HostAnalyzer(object):
