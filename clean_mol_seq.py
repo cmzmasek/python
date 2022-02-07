@@ -244,13 +244,13 @@ class CleanMolSeq(object):
 
 if __name__ == "__main__":
      CleanMolSeq.clean_mol_seqs(
-       '/home/lambda/Dropbox/WORK/JCVI/SARS_COV_2_REF_TREE/I_6_AUG_21/SARS2.fasta',
-       '/home/lambda/Dropbox/WORK/JCVI/SARS_COV_2_REF_TREE/I_6_AUG_21/SARS2_29400_09999.fasta',
+       '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_12_JAN_22/SARS2_2019_2021_29400_09999_plus_2022.fasta',
+       '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_12_JAN_22/SARS2_29400_09999.fasta',
        29400,
        0.9999,
        True,
-       '/home/lambda/Dropbox/WORK/JCVI/SARS_COV_2_REF_TREE/I_6_AUG_21/ProteinFastaResults_S.fasta',
-       '/home/lambda/Dropbox/WORK/JCVI/SARS_COV_2_REF_TREE/I_6_AUG_21/SARS2_29400_09999_prot_out.txt',
-       '/home/lambda/Dropbox/WORK/JCVI/SARS_COV_2_REF_TREE/I_6_AUG_21/SARS2_29400_09999_prot_out.fasta',
+       '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_12_JAN_22/ProteinFastaResultsS.fasta',
+       '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_12_JAN_22/SARS2_29400_09999_prot_out.txt',
+       '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_12_JAN_22/SARS2_29400_09999_prot_out.fasta',
        1250)
 
