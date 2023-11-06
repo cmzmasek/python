@@ -10,10 +10,18 @@ import re
 @staticmethod
     def read_ebird_file(file_name):
         source_df = pd.read_csv(file_name, encoding='unicode_escape', dtype={
-            "scientific name": str,
-            "family": str
+            'scientific name': str,
+            'order': str,
+            'family': str
         })
-    def read_family_to_feature_map_file():
+
+    def read_family_to_feature_map_file(file_name):
+        source_df = pd.read_csv(file_name, encoding='unicode_escape', dtype={
+            'ORDER': str,
+            'FAMILY': str,
+            'GENERA': str,
+            'FEATURE': str
+        })
 
 
 
