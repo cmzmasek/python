@@ -1,7 +1,7 @@
 import pandas as pd
 
 
-# Version 0.0.3
+# Version 0.0.4
 # Last modified 2023/15/06
 # Roshni Bhattacharya
 # Christian M. Zmasek
@@ -104,6 +104,8 @@ class BirdAnalyzer(object):
 
         mapped_on_scientific_name = 0
         mapped_on_common_name = 0
+        human = 0
+        swine = 0
         total = 0
         not_mapped = 0
 
@@ -113,10 +115,13 @@ class BirdAnalyzer(object):
             host_common_name = str(row['Host Common Name'])
             if BirdAnalyzer.DEBUG:
                 print(host_name + ', ' + host_common_name)
+
             if host_common_name.lower() == 'human' or host_name.lower() == 'homo sapiens':
-                pass
-            elif host_common_name.lower() == 'pig' or host_name.lower() == 'swine':  # Sus scrofa domesticus
-                pass
+                human += 1
+            elif host_common_name.lower() == 'pig' or host_common_name.lower() == 'swine' \
+                    or host_name.lower() == 'swine' or host_name.lower() == 'sus scrofa domesticus'\
+                    or host_name.lower() == 'sus scrofa':
+                swine += 1
             else:
                 if host_name in species_to_feature:
                     mapped_on_scientific_name += 1
@@ -128,10 +133,12 @@ class BirdAnalyzer(object):
                     not_mapped += 1
 
         print()
-        print("Total                    : " + str(total))
-        print("Mapped on scientific_name: " + str(mapped_on_scientific_name))
-        print("Mapped on common name    : " + str(mapped_on_common_name))
-        print("Not mapped               : " + str(not_mapped))
+        print("Total                          : " + str(total))
+        print("Human                          : " + str(human))
+        print("Swine                          : " + str(swine))
+        print("Birds mapped on scientific_name: " + str(mapped_on_scientific_name))
+        print("Birds mapped on common name    : " + str(mapped_on_common_name))
+        print("Not mapped                     : " + str(not_mapped))
 
 
 if __name__ == "__main__":
