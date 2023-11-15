@@ -1,20 +1,26 @@
 import pandas as pd
-import re
 
 
-# Version 0.0.1
-# Last modified 2023/11/06
+# Version 0.0.3
+# Last modified 2023/15/06
+# Roshni Bhattacharya
 # Christian M. Zmasek
 
 class BirdAnalyzer(object):
+    DEBUG = False
+
+    TAXONOMY_FILE_SCIENTIFIC_NAME = 'scientific name'
+    TAXONOMY_FILE_COMMON_NAME = 'English name'
+    TAXONOMY_FILE_ORDER = 'order'
+    TAXONOMY_FILE_FAMILY = 'family'
 
     @staticmethod
-    def read_ebird_file(file_name):
+    def read_taxonomy_file(file_name):
         source_df = pd.read_csv(file_name, encoding='unicode_escape', dtype={
-            'scientific name': str,
-            'English name': str,
-            'order': str,
-            'family': str
+            BirdAnalyzer.TAXONOMY_FILE_SCIENTIFIC_NAME: str,
+            BirdAnalyzer.TAXONOMY_FILE_COMMON_NAME: str,
+            BirdAnalyzer.TAXONOMY_FILE_ORDER: str,
+            BirdAnalyzer.TAXONOMY_FILE_FAMILY: str
         })
         return source_df
 
@@ -29,8 +35,8 @@ class BirdAnalyzer(object):
         return source_df
 
     @staticmethod
-    def read(ebird_master_table_file_name, ebird_to_feature_map_file_name):
-        ebird_master_table_df = BirdAnalyzer.read_ebird_file(ebird_master_table_file_name)
+    def make_species_to_feature_map(ebird_master_table_file_name, ebird_to_feature_map_file_name):
+        taxonomy_master_table_df = BirdAnalyzer.read_taxonomy_file(ebird_master_table_file_name)
         ebird_to_feature_map_df = BirdAnalyzer.read_family_to_feature_map_file(ebird_to_feature_map_file_name)
 
         order_to_feature = {}
@@ -55,11 +61,11 @@ class BirdAnalyzer(object):
 
         species_to_feature = {}
 
-        for index, row in ebird_master_table_df.iterrows():
-            sn = str(row['scientific name'])
-            cn = str(row['English name'])
-            order = str(row['order'])
-            family = str(row['family'])
+        for index, row in taxonomy_master_table_df.iterrows():
+            sn = str(row[BirdAnalyzer.TAXONOMY_FILE_SCIENTIFIC_NAME])
+            cn = str(row[BirdAnalyzer.TAXONOMY_FILE_COMMON_NAME])
+            order = str(row[BirdAnalyzer.TAXONOMY_FILE_ORDER])
+            family = str(row[BirdAnalyzer.TAXONOMY_FILE_FAMILY])
 
             if family.find('(') > 0:
                 family = family[0: family.index('(')].strip()
@@ -72,10 +78,63 @@ class BirdAnalyzer(object):
                         species_to_feature[sn] = family_to_feature[family]
                         if genus in genus_to_feature:
                             species_to_feature[sn] = genus_to_feature[genus]
+            if cn != 'nan':
+                if order != 'nan' and order in order_to_feature:
+                    species_to_feature[cn] = order_to_feature[order]
+                    if family != 'nan' and family in family_to_feature:
+                        species_to_feature[cn] = family_to_feature[family]
+                        if genus in genus_to_feature:
+                            species_to_feature[cn] = genus_to_feature[genus]
 
-        print(species_to_feature)
+        return species_to_feature
+
+    @staticmethod
+    def run(ebird_master_table_file_name, ebird_to_feature_map_file_name, annotation_file):
+
+        species_to_feature = BirdAnalyzer.make_species_to_feature_map(ebird_master_table_file_name,
+                                                                      ebird_to_feature_map_file_name)
+        if BirdAnalyzer.DEBUG:
+            print(species_to_feature)
+        annotation_df = pd.read_csv(annotation_file, encoding='unicode_escape', dtype={
+            'scientific name': str,
+            'English name': str,
+            'order': str,
+            'family': str
+        }, low_memory=False)
+
+        mapped_on_scientific_name = 0
+        mapped_on_common_name = 0
+        total = 0
+        not_mapped = 0
+
+        for index, row in annotation_df.iterrows():
+            total += 1
+            host_name = str(row['Host Name'])
+            host_common_name = str(row['Host Common Name'])
+            if BirdAnalyzer.DEBUG:
+                print(host_name + ', ' + host_common_name)
+            if host_common_name.lower() == 'human' or host_name.lower() == 'homo sapiens':
+                pass
+            elif host_common_name.lower() == 'pig' or host_name.lower() == 'swine':  # Sus scrofa domesticus
+                pass
+            else:
+                if host_name in species_to_feature:
+                    mapped_on_scientific_name += 1
+                    print(host_name + " -> " + species_to_feature[host_name])
+                elif host_common_name in species_to_feature:
+                    mapped_on_common_name += 1
+                    print(host_common_name + " -> " + species_to_feature[host_common_name])
+                else:
+                    not_mapped += 1
+
+        print()
+        print("Total                    : " + str(total))
+        print("Mapped on scientific_name: " + str(mapped_on_scientific_name))
+        print("Mapped on common name    : " + str(mapped_on_common_name))
+        print("Not mapped               : " + str(not_mapped))
 
 
 if __name__ == "__main__":
-    BirdAnalyzer.read('/Users/czmasek/Dropbox/WORK/JCVI/DL/ebird_oct_2022.csv',
-                      '/Users/czmasek/Dropbox/WORK/JCVI/DL/ebird_to_feature_map.csv')
+    BirdAnalyzer.run('/Users/czmasek/Dropbox/WORK/JCVI/DL/ebird_oct_2022.csv',
+                     '/Users/czmasek/Dropbox/WORK/JCVI/DL/ebird_to_feature_map.csv',
+                     '/Users/czmasek/Dropbox/WORK/JCVI/DL/Flu_A_Complete.csv')
