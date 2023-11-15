@@ -1,7 +1,7 @@
 import pandas as pd
 
 
-# Version 0.0.4
+# Version 0.0.5
 # Last modified 2023/15/06
 # Roshni Bhattacharya
 # Christian M. Zmasek
@@ -55,7 +55,7 @@ class BirdAnalyzer(object):
             if genera != 'nan' and feature != 'nan':
                 if genera.find(',') > 0:
                     for g in genera.split(','):
-                        genus_to_feature[g] = feature
+                        genus_to_feature[g.strip()] = feature
                 else:
                     genus_to_feature[genera] = feature
 
@@ -69,22 +69,27 @@ class BirdAnalyzer(object):
 
             if family.find('(') > 0:
                 family = family[0: family.index('(')].strip()
-            genus = sn[0: sn.find(' ')].strip()
 
             if sn != 'nan':
-                if order != 'nan' and order in order_to_feature:
+                genus = sn[0: sn.find(' ')].strip()
+            else:
+                genus = 'nan'
+
+            if sn != 'nan':
+                if genus != 'nan' and genus in genus_to_feature:
+                    species_to_feature[sn] = genus_to_feature[genus]
+                elif family != 'nan' and family in family_to_feature:
+                    species_to_feature[sn] = family_to_feature[family]
+                elif order != 'nan' and order in order_to_feature:
                     species_to_feature[sn] = order_to_feature[order]
-                    if family != 'nan' and family in family_to_feature:
-                        species_to_feature[sn] = family_to_feature[family]
-                        if genus in genus_to_feature:
-                            species_to_feature[sn] = genus_to_feature[genus]
+
             if cn != 'nan':
-                if order != 'nan' and order in order_to_feature:
+                if genus != 'nan' and genus in genus_to_feature:
+                    species_to_feature[cn] = genus_to_feature[genus]
+                elif family != 'nan' and family in family_to_feature:
+                    species_to_feature[cn] = family_to_feature[family]
+                elif order != 'nan' and order in order_to_feature:
                     species_to_feature[cn] = order_to_feature[order]
-                    if family != 'nan' and family in family_to_feature:
-                        species_to_feature[cn] = family_to_feature[family]
-                        if genus in genus_to_feature:
-                            species_to_feature[cn] = genus_to_feature[genus]
 
         return species_to_feature
 
@@ -119,7 +124,7 @@ class BirdAnalyzer(object):
             if host_common_name.lower() == 'human' or host_name.lower() == 'homo sapiens':
                 human += 1
             elif host_common_name.lower() == 'pig' or host_common_name.lower() == 'swine' \
-                    or host_name.lower() == 'swine' or host_name.lower() == 'sus scrofa domesticus'\
+                    or host_name.lower() == 'swine' or host_name.lower() == 'sus scrofa domesticus' \
                     or host_name.lower() == 'sus scrofa':
                 swine += 1
             else:
