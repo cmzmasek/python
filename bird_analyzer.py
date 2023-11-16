@@ -1,13 +1,12 @@
+import argparse as ap
 import pandas as pd
 
-
-# Version 0.0.7
-# Last modified 2023/15/06
+# Last modified 2023/16/06
 # Roshni Bhattacharya
 # Christian M. Zmasek
 
 class BirdAnalyzer(object):
-    IGNORE_CASE = True
+    VERSION = '0.0.8'
 
     DEBUG = False
 
@@ -150,7 +149,7 @@ class BirdAnalyzer(object):
                     mapped_on_common_name += 1
                     print(host_common_name + " -> " + taxonomy_to_feature[host_common_name])
                 else:
-                    #print(host_name + ', ' + host_common_name)
+                    # print(host_name + ', ' + host_common_name)
                     not_mapped += 1
 
         print()
@@ -163,6 +162,22 @@ class BirdAnalyzer(object):
 
 
 if __name__ == "__main__":
-    BirdAnalyzer.run('/Users/czmasek/Dropbox/WORK/JCVI/DL/ebird_oct_2022.csv',
-                     '/Users/czmasek/Dropbox/WORK/JCVI/DL/ebird_to_feature_map.csv',
-                     '/Users/czmasek/Dropbox/WORK/JCVI/DL/Flu_A_Complete.csv')
+    argument_parser = ap.ArgumentParser(prog='bird_analyzer',
+                                        description='mapping of taxonomy to feature')
+
+    argument_parser.add_argument(dest='taxonomy_file', help='taxonomy master table (example \'ebird_oct_2022.csv\')',
+                                 type=ap.FileType('r'))
+    argument_parser.add_argument(dest='feature_map_file',
+                                 help='taxonomy to feature map file (example \'ebird_to_feature_map.csv\')',
+                                 type=ap.FileType('r'))
+    argument_parser.add_argument(dest='annotation_file', help='annotation file (example \'Flu_A_Complete.csv\')',
+                                 type=ap.FileType('r'))
+    argument_parser.add_argument('--version', action='version', version='%(prog)s ' + BirdAnalyzer.VERSION)
+
+    args = argument_parser.parse_args()
+
+    tf = args.taxonomy_file
+    fm = args.feature_map_file
+    af = args.annotation_file
+
+    BirdAnalyzer.run(tf, fm, af)
