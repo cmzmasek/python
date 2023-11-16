@@ -1,12 +1,14 @@
 import pandas as pd
 
 
-# Version 0.0.6
+# Version 0.0.7
 # Last modified 2023/15/06
 # Roshni Bhattacharya
 # Christian M. Zmasek
 
 class BirdAnalyzer(object):
+    IGNORE_CASE = True
+
     DEBUG = False
 
     TAXONOMY_FILE_SCIENTIFIC_NAME = 'scientific name'
@@ -43,9 +45,9 @@ class BirdAnalyzer(object):
         return source_df
 
     @staticmethod
-    def make_taxonomy_to_feature_map(ebird_master_table_file_name, ebird_to_feature_map_file_name):
-        taxonomy_master_table_df = BirdAnalyzer.read_taxonomy_file(ebird_master_table_file_name)
-        taxonomy_to_feature_map_df = BirdAnalyzer.read_taxonomy_to_feature_map_file(ebird_to_feature_map_file_name)
+    def make_taxonomy_to_feature_map(taxonomy_master_file_name, taxonomy_to_feature_map_file_name):
+        taxonomy_master_table_df = BirdAnalyzer.read_taxonomy_file(taxonomy_master_file_name)
+        taxonomy_to_feature_map_df = BirdAnalyzer.read_taxonomy_to_feature_map_file(taxonomy_to_feature_map_file_name)
 
         order_to_feature = {}
         family_to_feature = {}
@@ -53,10 +55,10 @@ class BirdAnalyzer(object):
 
         for index, row in taxonomy_to_feature_map_df.iterrows():
 
-            order = str(row[BirdAnalyzer.TAXONOMY_MAP_FILE_ORDER])
-            family = str(row[BirdAnalyzer.TAXONOMY_MAP_FILE_FAMILY])
-            genera = str(row[BirdAnalyzer.TAXONOMY_MAP_FILE_GENERA])
-            feature = str(row[BirdAnalyzer.TAXONOMY_MAP_FILE_FEATURE])
+            order = str(row[BirdAnalyzer.TAXONOMY_MAP_FILE_ORDER]).lower().strip()
+            family = str(row[BirdAnalyzer.TAXONOMY_MAP_FILE_FAMILY]).lower().strip()
+            genera = str(row[BirdAnalyzer.TAXONOMY_MAP_FILE_GENERA]).lower().strip()
+            feature = str(row[BirdAnalyzer.TAXONOMY_MAP_FILE_FEATURE]).lower().strip()
             if order != 'nan' and feature != 'nan':
                 order_to_feature[order] = feature
             if family != 'nan' and feature != 'nan':
@@ -76,10 +78,10 @@ class BirdAnalyzer(object):
         taxonomy_to_feature = {}
 
         for index, row in taxonomy_master_table_df.iterrows():
-            sn = str(row[BirdAnalyzer.TAXONOMY_FILE_SCIENTIFIC_NAME])
-            cn = str(row[BirdAnalyzer.TAXONOMY_FILE_COMMON_NAME])
-            order = str(row[BirdAnalyzer.TAXONOMY_FILE_ORDER])
-            family = str(row[BirdAnalyzer.TAXONOMY_FILE_FAMILY])
+            sn = str(row[BirdAnalyzer.TAXONOMY_FILE_SCIENTIFIC_NAME]).lower().strip()
+            cn = str(row[BirdAnalyzer.TAXONOMY_FILE_COMMON_NAME]).lower().strip()
+            order = str(row[BirdAnalyzer.TAXONOMY_FILE_ORDER]).lower().strip()
+            family = str(row[BirdAnalyzer.TAXONOMY_FILE_FAMILY]).lower().strip()
 
             if family.find('(') > 0:
                 family = family[0: family.index('(')].strip()
@@ -129,16 +131,16 @@ class BirdAnalyzer(object):
 
         for index, row in annotation_df.iterrows():
             total += 1
-            host_name = str(row[BirdAnalyzer.ANNOTATION_FILE_HOST_NAME])
-            host_common_name = str(row[BirdAnalyzer.ANNOTATION_FILE_COMMON_HOST_NAME])
+            host_name = str(row[BirdAnalyzer.ANNOTATION_FILE_HOST_NAME]).lower().strip()
+            host_common_name = str(row[BirdAnalyzer.ANNOTATION_FILE_COMMON_HOST_NAME]).lower().strip()
             if BirdAnalyzer.DEBUG:
                 print(host_name + ', ' + host_common_name)
 
-            if host_common_name.lower() == 'human' or host_name.lower() == 'homo sapiens':
+            if host_common_name == 'human' or host_name == 'homo sapiens':
                 human += 1
-            elif host_common_name.lower() == 'pig' or host_common_name.lower() == 'swine' \
-                    or host_name.lower() == 'swine' or host_name.lower() == 'sus scrofa domesticus' \
-                    or host_name.lower() == 'sus scrofa':
+            elif host_common_name == 'pig' or host_common_name == 'swine' \
+                    or host_name == 'swine' or host_name == 'sus scrofa domesticus' \
+                    or host_name == 'sus scrofa':
                 swine += 1
             else:
                 if host_name in taxonomy_to_feature:
@@ -148,6 +150,7 @@ class BirdAnalyzer(object):
                     mapped_on_common_name += 1
                     print(host_common_name + " -> " + taxonomy_to_feature[host_common_name])
                 else:
+                    #print(host_name + ', ' + host_common_name)
                     not_mapped += 1
 
         print()
