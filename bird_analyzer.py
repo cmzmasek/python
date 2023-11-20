@@ -1,7 +1,9 @@
 import argparse as ap
+
 import pandas as pd
 
-# Last modified 2023/16/06
+
+# Last modified 2023/11/20
 # Roshni Bhattacharya
 # Christian M. Zmasek
 
@@ -162,6 +164,11 @@ class BirdAnalyzer(object):
 
 
 if __name__ == "__main__":
+    # Uncomment this for testing in PyCharm:
+    # BirdAnalyzer.run('/Users/czmasek/Dropbox/WORK/JCVI/DL/ebird_oct_2022.csv',
+    #                 '/Users/czmasek/Dropbox/WORK/JCVI/DL/ebird_to_feature_map.csv',
+    #                 '/Users/czmasek/Dropbox/WORK/JCVI/DL/Flu_A_Complete.csv')
+
     argument_parser = ap.ArgumentParser(prog='bird_analyzer',
                                         description='mapping of taxonomy to feature')
 
