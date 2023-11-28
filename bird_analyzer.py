@@ -160,24 +160,25 @@ class BirdAnalyzer(object):
 
             if host_common_name == 'human' or host_name == 'homo sapiens':
                 human += 1
-                o.write(gb_acc + '\t' + genome_id + '\t' + 'human' + '\n')
+                o.write(gb_acc + '\t' + genome_id + '\t' + host_common_name + '\t' + 'human' + '\n')
             elif host_common_name in BirdAnalyzer.SWINE or host_name in BirdAnalyzer.SWINE:
                 swine += 1
-                o.write(gb_acc + '\t' + genome_id + '\t' + 'swine' + '\n')
+                o.write(gb_acc + '\t' + genome_id + '\t' + host_common_name + '\t' + 'swine' + '\n')
             elif host_common_name in BirdAnalyzer.OTHER_MAMMALS or host_name in BirdAnalyzer.OTHER_MAMMALS:
                 other_mammals += 1
-                o.write(gb_acc + '\t' + genome_id + '\t' + 'other_mammals' + '\n')
+                o.write(gb_acc + '\t' + genome_id + '\t' + host_common_name + '\t' + 'other_mammals' + '\n')
             else:
                 if host_name in taxonomy_to_feature:
                     mapped_on_scientific_name += 1
                     if BirdAnalyzer.DEBUG_2:
                         print(host_name + " -> " + taxonomy_to_feature[host_name])
-                    o.write(gb_acc + '\t' + genome_id + '\t' + taxonomy_to_feature[host_name] + '\n')
+                    o.write(gb_acc + '\t' + genome_id + '\t' + host_name + '\t' + taxonomy_to_feature[host_name] + '\n')
                 elif host_common_name in taxonomy_to_feature:
                     mapped_on_common_name += 1
                     if BirdAnalyzer.DEBUG_2:
                         print(host_common_name + " -> " + taxonomy_to_feature[host_common_name])
-                    o.write(gb_acc + '\t' + genome_id + '\t' + taxonomy_to_feature[host_common_name] + '\n')
+                    o.write(gb_acc + '\t' + genome_id + '\t' + host_common_name + '\t' + taxonomy_to_feature[
+                        host_common_name] + '\n')
                 else:
                     # print(host_name + ', ' + host_common_name)
                     not_mapped += 1
