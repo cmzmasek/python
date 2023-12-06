@@ -1,4 +1,6 @@
 import argparse as ap
+import os
+import sys
 
 import tcg_card_parsers as parser
 
@@ -11,42 +13,61 @@ class MtgCompare(object):
         scryfall_cards_list = parser.CardParsers.parse_scryfall_spreadsheet(scryfall_infile)
         manabox_cards_list = parser.CardParsers.parse_manabox_export(manabox_infile)
 
-        print('scryfall          : ' + str(len(scryfall_cards_list)))
-        print('manabox           : ' + str(len(manabox_cards_list)))
+        print('Scryfall (all)                : ' + str(len(scryfall_cards_list)))
+        print('Manabox (all)                 : ' + str(len(manabox_cards_list)))
 
         scryfall_cards = set(scryfall_cards_list)
         manabox_cards = set(manabox_cards_list)
 
-        print('scryfall          : ' + str(len(scryfall_cards)))
-        print('manabox           : ' + str(len(manabox_cards)))
+        print('Scryfall (set)                : ' + str(len(scryfall_cards)))
+        print('ManaBox (set)                 : ' + str(len(manabox_cards)))
 
-        intersection = scryfall_cards.intersection(manabox_cards)
-        print('intersection      : ' + str(len(intersection)))
+        intersection = manabox_cards.intersection(scryfall_cards)
+        print('Intersection                  : ' + str(len(intersection)))
 
         scryfall_minus_manabox = scryfall_cards.difference(manabox_cards)
-        print('scryfall minus manabox: ' + str(len(scryfall_minus_manabox)))
+        print('Scryfall minus ManaBox (SF-MB): ' + str(len(scryfall_minus_manabox)))
 
         manabox_minus_scryfall = manabox_cards.difference(scryfall_cards)
-        print('manabox minus scryfall : ' + str(len(manabox_minus_scryfall)))
+        print('ManaBox minus Scryfall (MB-SF): ' + str(len(manabox_minus_scryfall)))
 
-        with open(outfile_base + '__INTERSECTION', "w") as f:
+        of = outfile_base + '__Intersection.tsv'
+        if os.path.isfile(of):
+            print('\n' + of + ' already exists' + '\n')
+            sys.exit()
+
+        with open(of, 'w') as f:
             for c in sorted(intersection):
                 f.write(
-                    c.get_name() + ' (' + c.get_set() + ')' + ' [' + c.get_set_code() + ']' + ' [' + c.get_card_number() + ']' + ' [' + c.get_finish()  + ']')
-
+                    c.get_name() + '\t(' + c.get_set() + ')' + '\t' + c.get_set_code() +
+                    '\t' + c.get_card_number() + ' \t' + c.get_artist() +
+                    '\t' + c.get_finish())
                 f.write('\n')
 
-        with open(outfile_base + '__SF-O', "w") as f:
+        of = outfile_base + '__SF-MB.tsv'
+        if os.path.isfile(of):
+            print('\n' + of + ' already exists' + '\n')
+            sys.exit()
+
+        with open(of, 'w') as f:
             for c in sorted(scryfall_minus_manabox):
                 f.write(
-                    c.get_name() + ' (' + c.get_set() + ')' + ' [' + c.get_set_code() + ']' + ' [' + c.get_card_number() + ']' + ' [' + c.get_finish()  + ']')
-
+                    c.get_name() + '\t(' + c.get_set() + ')' + '\t' + c.get_set_code() +
+                    '\t' + c.get_card_number() + ' \t' + c.get_artist() +
+                    '\t' + c.get_finish())
                 f.write('\n')
 
-        with open(outfile_base + '__O-SF', "w") as f:
+        of = outfile_base + '__MB-SF.tsv'
+        if os.path.isfile(of):
+            print('\n' + of + ' already exists' + '\n')
+            sys.exit()
+
+        with open(of, 'w') as f:
             for c in sorted(manabox_minus_scryfall):
                 f.write(
-                    c.get_name() + ' (' + c.get_set() + ')' + ' [' + c.get_set_code() + ']' + ' [' + c.get_card_number() + ']' + ' [' + c.get_finish() + ']')
+                    c.get_name() + '\t(' + c.get_set() + ')' + '\t' + c.get_set_code() +
+                    '\t' + c.get_card_number() + ' \t' + c.get_artist() +
+                    '\t' + c.get_finish())
                 f.write('\n')
 
 

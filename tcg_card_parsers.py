@@ -1,4 +1,5 @@
 import csv
+
 import tcg_card as card
 import util as util
 
@@ -78,13 +79,13 @@ class CardParsers(object):
                 if foil.lower() == 'normal':
                     finish = ''
 
-
                 c = card.Card(GAME, name, card_type, card_subtype, set_name, set_code, card_number, lang, rarity,
                               artist,
                               finish, art_type, uri, scryfall_id, release_date, illustration_id)
                 cards.append(c)
 
             return cards
+
     @staticmethod
     def parse_tcg_player_collection(tcg_infile):
         GAME = 'Magic'
@@ -136,6 +137,3 @@ class CardParsers(object):
                 cards.append(c)
 
             return cards
-
-
-
