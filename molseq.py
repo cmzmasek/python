@@ -44,6 +44,7 @@ class MolSeq(object):
                 self.get_seq().count('?') + self.get_seq().count('X') + self.get_seq().count('x') +
                 self.get_seq().count('*') + self.get_seq().count('.'))
 
+
     def __str__(self):
         return self.to_fasta_wrapped(60)
 
