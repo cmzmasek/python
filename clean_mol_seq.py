@@ -1,12 +1,17 @@
+import argparse as ap
+import os
 import re
+import sys
 
 import molseq
 
 
 class CleanMolSeq(object):
-    ID_RE = re.compile(">\s*(.+)")
-    GAP_RE = re.compile("[-\s]+")
-    WS_RE = re.compile("[\s]+")
+    VERSION = '1.0.0'
+
+    ID_RE = re.compile(">\\s*(.+)")
+    GAP_RE = re.compile("[-\\s]+")
+    WS_RE = re.compile("\\s+")
 
     @staticmethod
     def stream_fasta(in_stream, remove_gaps=False):
@@ -89,6 +94,11 @@ class CleanMolSeq(object):
     def clean_mol_seqs(infile, outfile, min_length, min_ratio, verbose, protein_file=None, protein_outfile=None,
                        protein_outfile_fasta=None,
                        protein_min_length=0):
+
+        if os.path.isfile(outfile):
+            print(outfile + ' already exists')
+            sys.exit()
+
         genomes = None
         if protein_file:
             genomes = CleanMolSeq.read_protein_fasta_file(protein_file, protein_outfile, protein_min_length)
@@ -127,7 +137,8 @@ class CleanMolSeq(object):
 
         for mol_seq in CleanMolSeq.stream_fasta(f0, True):
             name_lwr = mol_seq.get_seq_id().lower()
-            if '|severe_acute_respiratory_syndrome_related_coronavirus' in name_lwr or '2019_ncov' in name_lwr or 'hcov_19' in name_lwr or 'sars_cov_2' in name_lwr or 'sars_cov2' in name_lwr:
+           # if 'coronavirus 2' in name_lwr or '|severe_acute_respiratory_syndrome_related_coronavirus' in name_lwr or '2019_ncov' in name_lwr or 'hcov_19' in name_lwr or 'sars_cov_2' in name_lwr or 'sars_cov2' in name_lwr:
+            if True:
                 total += 1
                 reg = mol_seq.count_regular_chars_na()
                 length = mol_seq.get_length()
@@ -195,6 +206,10 @@ class CleanMolSeq(object):
                             kept += 1
                             f1.write(mol_seq.to_fasta_wrapped(80))
                             f1.write('\n')
+                        else:
+                            kept += 1
+                            f1.write(mol_seq.to_fasta_wrapped(80))
+                            f1.write('\n')
                     else:
                         ignored_irr_chars += 1
                 else:
@@ -232,25 +247,56 @@ class CleanMolSeq(object):
             CleanMolSeq.extract_from_protein_fasta_file(protein_file, protein_outfile_fasta,
                                                         keep_proteins_genome_acc)
 
-            print('Genomes: Ignored Name        : ' + str(ignored_name))
-            print('Genomes: Total (Correct Name): ' + str(total))
-            print('Genomes: Ignored Length      : ' + str(ignored_length))
-            print('Genomes: Ignored Irreg Chars : ' + str(ignored_irr_chars))
-            if genomes:
-                print('Genomes: Ignored No Protein  : ' + str(ignored_no_protein))
-                print('Genomes: Kept                : ' + str(kept))
-                print()
+        print('Genomes: Ignored Name        : ' + str(ignored_name))
+        print('Genomes: Total (Correct Name): ' + str(total))
+        print('Genomes: Ignored Length      : ' + str(ignored_length))
+        print('Genomes: Ignored Irreg Chars : ' + str(ignored_irr_chars))
+        if genomes:
+            print('Genomes: Ignored No Protein  : ' + str(ignored_no_protein))
+            print('Genomes: Kept                : ' + str(kept))
+            print()
 
 
 if __name__ == "__main__":
-     CleanMolSeq.clean_mol_seqs(
-       '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_12_JAN_22/SARS2_2019_2021_29400_09999_plus_2022.fasta',
-       '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_12_JAN_22/SARS2_29400_09999.fasta',
-       29400,
-       0.9999,
-       True,
-       '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_12_JAN_22/ProteinFastaResultsS.fasta',
-       '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_12_JAN_22/SARS2_29400_09999_prot_out.txt',
-       '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_12_JAN_22/SARS2_29400_09999_prot_out.fasta',
-       1250)
+    argument_parser = ap.ArgumentParser(prog='clean_mol_seq')
 
+    argument_parser.add_argument(dest='in_file', help='fasta in file (example \'sequences.fasta\')',
+                                 type=str)
+
+    argument_parser.add_argument(dest='out_file', help='fasta out file (example \'sequences_29400_09999.fasta\')',
+                                 type=str)
+    argument_parser.add_argument('--version', action='version', version='%(prog)s ' + CleanMolSeq.VERSION)
+
+    args = argument_parser.parse_args()
+
+    in_file = args.in_file
+    out_file = args.out_file
+
+    CleanMolSeq.clean_mol_seqs(
+        in_file,
+        out_file,
+        29400,
+        0.9999,
+        True)
+
+    # CleanMolSeq.clean_mol_seqs(
+    #  '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_21_OCT_22/SARS2.fasta',
+    #  '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_21_OCT_22/SARS2_29400_09999.fasta',
+    #  29400,
+    #  0.9999,
+    #  True,
+    #  '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_21_OCT_22/ProteinFastaResults_S.fasta',
+    #  '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_21_OCT_22/SARS2_29400_09999_prot_out.txt',
+    #  '/home/lambda/WORK/SARS_COV_2_REF_TREE/I_21_OCT_22/SARS2_29400_09999_prot_out.fasta',
+    #  1250)
+
+    # CleanMolSeq.clean_mol_seqs(
+    #    '/Users/czmasek/Dropbox/WORK/JCVI/SARS_COV_2_REF_TREE/OCT_2023/sequences_ncbi_10132023.fasta',
+    #    '/Users/czmasek/Dropbox/WORK/JCVI/SARS_COV_2_REF_TREE/OCT_2023/sequences_ncbi_10132023_29400_09999.fasta',
+    #    29400,
+    #    0.9999,
+    #    True )
+
+#   def clean_mol_seqs(infile, outfile, min_length, min_ratio, verbose, protein_file=None, protein_outfile=None,
+#                        protein_outfile_fasta=None,
+#                        protein_min_length=0):
