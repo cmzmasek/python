@@ -109,13 +109,14 @@ if __name__ == "__main__":
     argument_parser.add_argument(dest='out_file', help='fasta out file (example \'sequences_29400_09999.fasta\')',
                                  type=str)
 
-    argument_parser.add_argument('-ml', dest='minimal_length', help='minimal length', type=int, default=10)
+    argument_parser.add_argument('-ml', dest='minimal_length', help='minimal length (default: 20)', type=int,
+                                 default=20)
 
-    argument_parser.add_argument('-r', dest='ratio', help='valid char ratio', type=float, default=0.999)
+    argument_parser.add_argument('-r', dest='ratio', help='valid char ratio(default: 0.99)', type=float, default=0.99)
 
-    argument_parser.add_argument('-t', dest='type', help='aa or na', type=str, default='aa')
+    argument_parser.add_argument('-t', dest='type', help='aa or na (default: aa)', type=str, default='aa')
 
-    argument_parser.add_argument('-u', dest='unique_ids', help='t or f', type=str, default='t')
+    argument_parser.add_argument('-u', dest='unique_ids', help='t or f (default: t)', type=str, default='t')
 
     argument_parser.add_argument('--version', action='version', version='%(prog)s ' + CleanFasta.VERSION)
 
