@@ -36,7 +36,9 @@ class PeptideMapping(object):
     COMBINE_WHITESPACE_RE = re.compile(r"\s+")
 
     @staticmethod
-    def map(query, target):
+    def perform_mapping(query, target):
+        if len(target) <= len(query):
+            raise ValueError("Query must be shorter than target.")
         best_score = len(query) + 1
         best_matches = None
         query_len = len(query)
@@ -53,8 +55,13 @@ class PeptideMapping(object):
         return best_matches
 
     @staticmethod
-    def map_windowed(query, target, window_start, window_end):
-        return map(query, target[window_start: window_end + 1])
+    def perform_mapping_windowed(query, target, window_start, window_end):
+        if window_end > len(target) - 1 or window_start < 0:
+            raise ValueError("Start or end are out of bounds.")
+        if window_end <= window_start:
+            raise ValueError("Start must be smaller than end.")
+
+        return PeptideMapping.perform_mapping(query, target[window_start: window_end + 1])
 
     @staticmethod
     def hamming_distance(s1, s2):
@@ -73,11 +80,14 @@ if __name__ == "__main__":
 
     print(PeptideMapping.inverted_normalized_hamming_distance("abcd", "abcd"))
 
-    m = PeptideMapping.map("query", "queryquery")
+    m = PeptideMapping.perform_mapping("query", "queryquery")
     print(m)
 
-    m = PeptideMapping.map("abc", "abccbacbcbabc")
+    m = PeptideMapping.perform_mapping("abc", "abccbacbcbabc")
     print(m)
 
-    m = PeptideMapping.map("abcd", "mnapnmpnmnpnonappn")
+    m = PeptideMapping.perform_mapping("abcd", "mnapnmpnmnpnonappn")
+    print(m)
+
+    m = PeptideMapping.perform_mapping_windowed("abcd", "mnapnmpnmnpnonappn", 0, 10)
     print(m)
