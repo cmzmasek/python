@@ -25,6 +25,8 @@
 
 class TargetMatch(object):
 
+    # Used by PeptideMapping
+
     def __init__(self, query_start, query_end, query_sequence, target_start, target_end, target_sequence, distance,
                  score=0.0):
         if target_end <= target_start or query_end <= query_start:
