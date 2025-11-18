@@ -25,32 +25,61 @@
 
 class TargetMatch(object):
 
-    def __init__(self, start, end, score, sequence):
-        if end <= start:
+    def __init__(self, query_start, query_end, target_start, target_end, score, query_sequence, target_sequence):
+        if target_end <= target_start or query_end <= query_start:
             raise ValueError("Start must be smaller than end.")
-        self.__start = int(start)
-        self.__end = int(end)
+        if len(query_sequence) != len(target_sequence):
+            raise ValueError("Query and target sequences must have same length.")
+        if target_end - target_start != query_end - query_start:
+            raise ValueError("Query and target must have same length by coordinates.")
+        if target_end - target_start + 1 != len(target_sequence):
+            raise ValueError("Target sequence length does not much length by coordinates")
+        if query_end - query_start + 1 != len(query_sequence):
+            raise ValueError("Query sequence length does not much length by coordinates")
+        self.__query_start = int(query_start)
+        self.__query_end = int(query_end)
+        self.__target_start = int(target_start)
+        self.__target_end = int(target_end)
         self.__score = int(score)
-        self.__sequence = str(sequence).strip()
+        self.__query_sequence = str(query_sequence)
+        self.__target_sequence = str(target_sequence)
 
-    def get_start(self):
-        return self.__start
+    def get_query_start(self):
+        return self.__query_start
 
-    def get_end(self):
-        return self.__end
+    def get_query_end(self):
+        return self.__query_end
+
+    def get_target_start(self):
+        return self.__target_start
+
+    def get_target_end(self):
+        return self.__target_end
 
     def get_score(self):
         return self.__score
 
-    def get_sequence(self):
-        return self.__sequence
+    def get_target_sequence(self):
+        return self.__query_sequence
+
+    def get_query_sequence(self):
+        return self.__target_sequence
 
     def calc_length(self):
-        return 1 + self.get_end() - self.get_start()
+        return 1 + self.get_query_end() - self.get_query_start()
 
     def to_fasta(self):
-        return ">{}\n{}".format(str(self.get_start()) + "-" + str(self.get_end()) + "_" + str(self.get_score()),
-                                self.get_sequence())
+        return ">{}\n{}".format(
+            str(self.get_target_start()) + "-" + str(self.get_target_end()) + "_" + str(self.get_score()),
+            self.get_target_sequence())
+
+    def to_aln(self):
+        return "{}\n{}\n{}\n{}".format(
+            str(self.get_query_start()) + "-" + str(self.get_query_end()),
+            str(self.get_query_sequence()),
+            str(self.get_target_sequence()),
+            str(self.get_target_start()) + "-" + str(self.get_target_end())
+        )
 
     def __str__(self):
         return self.to_fasta()
@@ -59,14 +88,17 @@ class TargetMatch(object):
         return self.calc_length()
 
     def __repr__(self):
-        return "{}:{}:{}:{}:{}".format(self.__class__.__name__, self.get_start(), self.get_end(), self.get_sequence(),
-                                       self.get_score())
+        return "{}:{}:{}:{}:{}:{}:{}:{}".format(self.__class__.__name__, self.get_query_start(), self.get_query_end(),
+                                                self.get_target_start(), self.get_target_end(),
+                                                self.get_target_sequence(), self.get_query_sequence(),
+                                                self.get_score())
 
 
 if __name__ == "__main__":
-    t = TargetMatch(3, 5, 0.1, "abgty")
+    t = TargetMatch(3, 7, 13, 17, 11, "abgty", "abxxx")
 
     print(t.to_fasta())
     print(t.calc_length())
     print(str(t))
     print(repr(t))
+    print(t.to_aln())
