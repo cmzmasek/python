@@ -31,7 +31,7 @@ import target_match
 
 
 class PeptideMapping(object):
-    VERSION = '1.0.0'
+    VERSION = '1.0.1'
 
     ID_RE = re.compile(">\\s*(.+)")
     GAP_RE = re.compile("[-\\s]+")
@@ -129,9 +129,8 @@ class PeptideMapping(object):
                             norm = PeptideMapping.calc_inverted_normalized_hamming_distance(m0.get_distance(),
                                                                                             m0.calc_length())
 
-                            coord_dist = abs(
-                                (query_from + (query_to - query_from) / 2) - (
-                                        m0.get_target_start() + (m0.get_target_end() - m0.get_target_start()) / 2))
+                            coord_dist = (query_from + (query_to - query_from) / 2) - (
+                                    m0.get_target_start() + (m0.get_target_end() - m0.get_target_start()) / 2)
 
                             of.write(query_seq)
                             of.write("\t")
