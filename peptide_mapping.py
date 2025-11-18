@@ -21,14 +21,17 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 # OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
+import argparse as ap
+import os
 import re
+import sys
 
+import fasta_parser
 import target_match
 
 
 class PeptideMapping(object):
-    VERSION = '0.0.0'
+    VERSION = '1.0.0'
 
     ID_RE = re.compile(">\\s*(.+)")
     GAP_RE = re.compile("[-\\s]+")
@@ -42,7 +45,7 @@ class PeptideMapping(object):
         if window_end <= window_start:
             raise ValueError("Start must be smaller than end.")
 
-        return perform_mapping(query, target[window_start: window_end + 1], query_start, query_end)
+        return PeptideMapping.perform_mapping(query, target[window_start: window_end + 1], query_start, query_end, 12)
 
     @staticmethod
     def hamming_distance(s1, s2):
@@ -53,51 +56,149 @@ class PeptideMapping(object):
 
     @staticmethod
     def inverted_normalized_hamming_distance(s1, s2):
-        return 1 - PeptideMapping.hamming_distance(s1, s2) / len(s1)
+        return PeptideMapping.calc_inverted_normalized_hamming_distance(PeptideMapping.hamming_distance(s1, s2),
+                                                                        len(s1))
 
+    @staticmethod
+    def calc_inverted_normalized_hamming_distance(dist, length):
+        return 1 - dist / length
 
-def perform_mapping(query, target, query_start, query_end):
-    if len(target) <= len(query):
-        raise ValueError("Query must be shorter than target.")
-    best_score = len(query) + 1
-    best_matches = None
-    query_len = len(query)
-    for i in range(len(target) - query_len + 1):
-        t = target[i:i + query_len]
-        dist = PeptideMapping.hamming_distance(t, query)
-        # print(t + ": " + str(d))
-        if dist <= best_score:
-            if dist < best_score:
-                best_matches = []
-                best_score = dist
-            best_matches.append(target_match.TargetMatch(query_start, query_end, i, i + query_len - 1, dist, query, t))
+    @staticmethod
+    def calculate_score(dist, query_center_coord, target_center_coord):
+        return dist + abs(query_center_coord - target_center_coord) / 10
 
-    return best_matches
+    @staticmethod
+    def perform_mapping(query, target, query_start, query_end, max_dist):
+        if len(target) <= len(query):
+            raise ValueError("Query must be shorter than target.")
+        least_dist = len(query) + 1
+        best_matches = []
+        query_len = len(query)
+        for target_start in range(len(target) - query_len + 1):
+            t = target[target_start:target_start + query_len]
+            dist = PeptideMapping.hamming_distance(t, query)
+            # if dist <= least_dist:
+            if dist <= max_dist:
+                # if dist < least_dist:
+                #    best_matches = []
+                #    least_dist = dist
+                target_end = target_start + query_len - 1
+                score = PeptideMapping.calculate_score(dist, query_start + (query_end - query_start) / 2,
+                                                       target_start + (target_end - target_start) / 2)
+                best_matches.append(target_match.TargetMatch(query_start, query_end, query, target_start, target_end, t,
+                                                             dist, score))
+
+        return best_matches
+
+    @staticmethod
+    def transpose(in_table, seq_file, protein_name, outfile, max_dist, verbose):
+
+        if os.path.isfile(outfile):
+            print(outfile + ' already exists')
+            sys.exit()
+
+        seqs = fasta_parser.parse_fasta_file(seq_file, remove_gaps=True)
+        seq = seqs[0]
+        target_seq = seq.get_seq()
+        of = open(outfile, 'w')
+        with open(in_table, 'r') as file:
+            for line in file:
+                line = line.strip()
+                if not line.startswith("#"):
+                    values = line.split("\t")
+                    query_seq = values[0]
+                    orf = values[1]
+                    protein = values[2]
+                    query_from = int(values[3])
+                    query_to = int(values[4])
+
+                    if protein == protein_name:
+                        m = PeptideMapping.perform_mapping(query_seq, target_seq, query_from, query_to, max_dist)
+
+                        m.sort()
+                        m0 = m[0]
+                        norm = PeptideMapping.calc_inverted_normalized_hamming_distance(m0.get_distance(),
+                                                                                        m0.calc_length())
+                        of.write(query_seq)
+                        of.write("\t")
+                        of.write(protein_name)
+                        of.write("\t")
+                        of.write(orf)
+                        of.write("\t")
+                        of.write(str(query_from))
+                        of.write("\t")
+                        of.write(str(query_to))
+                        of.write("\t")
+                        of.write(m0.get_target_sequence())
+                        of.write("\t")
+                        of.write(str(m0.get_target_start()))
+                        of.write("\t")
+                        of.write(str(m0.get_target_end()))
+                        of.write("\t")
+                        of.write(str(len(m)))
+                        of.write("\t")
+                        of.write(str(norm))
+                        of.write("\t")
+                        of.write(str(m0.get_distance()))
+                        of.write("\t")
+                        of.write(str(m0.get_score()))
+                        of.write("\n")
+
+                        if verbose:
+                            for i, x in enumerate(m):
+                                norm = PeptideMapping.calc_inverted_normalized_hamming_distance(x.get_distance(),
+                                                                                                x.calc_length())
+                                print(str(i) + ": ")
+                                print("Hamming distance     : " + str(x.get_distance()))
+                                print("Norm Hamming distance: " + str(norm))
+                                print("Score                : " + str(x.get_score()))
+                                print(x.to_aln())
+                                print("----------------------------------------")
+        of.close()
 
 
 if __name__ == "__main__":
-    print(PeptideMapping.inverted_normalized_hamming_distance("abcd", "axyx"))
+    # Example:
+    # % peptide_mapping -name S -md 11 NL63_S.fasta SARS2.txt Spike_SARS2_to_NL63.txt
 
-    print(PeptideMapping.inverted_normalized_hamming_distance("abcd", "abcd"))
+    argument_parser = ap.ArgumentParser(prog='peptide_mapping',
+                                        description='transposition/mapping of peptide sequences')
 
-    m = perform_mapping("query", "queryquery", 0, 4)
-    for x in m:
-        print(str(x.get_score()) + ":")
-        print(x.to_aln())
+    argument_parser.add_argument(dest='in_seq', help='fasta target sequence file (example \'Spike_NL63.fasta\')',
+                                 type=str)
 
-    m = perform_mapping("abc", "abccbacbcbabc", 0, 2)
-    for x in m:
-        print(str(x.get_score()) + ":")
-        print(x.to_aln())
+    argument_parser.add_argument(dest='in_tab',
+                                 help='table listing query peptides, tab separated (example \'SARS2.txt\')',
+                                 type=str)
 
-    m = perform_mapping("abcd", "mnapnmpnmnpnonappn", 0, 3)
+    argument_parser.add_argument(dest='out_file', help='out file (example \'Spike_SARS2_to_NL63.txt\')',
+                                 type=str)
 
-    for x in m:
-        print(str(x.get_score()) + ":")
-        print(x.to_aln())
+    argument_parser.add_argument('-md', dest='maximal_distance', help='maximal distance (default: 12)', type=int,
+                                 default=12)
 
-    m = PeptideMapping.perform_mapping_windowed("abcd", "mnapnmpnmnpnonappn", 0, 3, 0, 10)
+    argument_parser.add_argument('-verbose', dest='verbose', help='verbose', type=bool,
+                                 default=False)
 
-    for x in m:
-        print(str(x.get_score()) + ":")
-        print(x.to_aln())
+    argument_parser.add_argument('-name', dest='protein_name', help='protein name (example \'S\')', type=str,
+                                 required=True
+                                 )
+    argument_parser.add_argument('--version', action='version', version='%(prog)s ' + PeptideMapping.VERSION)
+
+    args = argument_parser.parse_args()
+
+    in_seq = args.in_seq
+    in_tab = args.in_tab
+    out_file = args.out_file
+    md = args.maximal_distance
+    pn = args.protein_name
+    verb = args.verbose
+
+    print('Protein name        : ' + str(pn))
+    print('Maximal distance    : ' + str(md))
+    print('Target sequence file: ' + str(in_seq))
+    print('Query peptides file : ' + str(in_tab))
+    print('Output              : ' + str(out_file))
+    print()
+
+    PeptideMapping.transpose(in_tab, in_seq, pn, out_file, md, verb)
