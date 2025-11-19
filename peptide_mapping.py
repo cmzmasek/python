@@ -30,17 +30,7 @@ import target_match
 
 
 class PeptideMapping(object):
-    VERSION = '1.0.1'
-
-    @staticmethod
-    def perform_mapping_windowed(query, target, query_start, query_end, window_start, window_end):
-        if window_end > len(target) - 1 or window_start < 0:
-            raise ValueError("Start or end are out of bounds.")
-        if window_end <= window_start:
-            raise ValueError("Start must be smaller than end.")
-
-        return PeptideMapping.perform_mapping(query, target[window_start: window_end + 1], query_start, query_end, 12,
-                                              0.1)
+    VERSION = '1.0.2'
 
     @staticmethod
     def hamming_distance(s1, s2):
@@ -72,11 +62,7 @@ class PeptideMapping(object):
         for target_start in range(len(target) - query_len + 1):
             t = target[target_start:target_start + query_len]
             dist = PeptideMapping.hamming_distance(t, query)
-            # if dist <= least_dist:
             if dist <= max_dist:
-                # if dist < least_dist:
-                #    best_matches = []
-                #    least_dist = dist
                 target_end = target_start + query_len - 1
 
                 query_center_coord = query_start + (query_end - query_start) / 2
@@ -120,11 +106,10 @@ class PeptideMapping(object):
                         if len(m) > 0:
                             m.sort()
                             m0 = m[0]
-                            norm = PeptideMapping.calc_inverted_normalized_hamming_distance(m0.get_distance(),
-                                                                                            m0.calc_length())
+                            norm_hamming = PeptideMapping.calc_inverted_normalized_hamming_distance(m0.get_distance(),
+                                                                                                    m0.calc_length())
 
-                            coord_dist = (query_from + (query_to - query_from) / 2) - (
-                                    m0.get_target_start() + (m0.get_target_end() - m0.get_target_start()) / 2)
+                            coord_diff = PeptideMapping.calc_coord_diff(m0, query_from, query_to)
 
                             of.write(query_seq)
                             of.write("\t")
@@ -142,14 +127,50 @@ class PeptideMapping(object):
                             of.write("\t")
                             of.write(str(m0.get_target_end()))
                             of.write("\t")
-                            of.write(str(norm))
+                            of.write(str(norm_hamming))
                             of.write("\t")
                             of.write(str(m0.get_distance()))
                             of.write("\t")
                             of.write(str(m0.get_score()))
                             of.write("\t")
-                            of.write(str(coord_dist))
+                            of.write(str(coord_diff))
                             of.write("\t")
+
+                            if len(m) > 1:
+                                m1 = m[1]
+                                norm_hamming = PeptideMapping.calc_inverted_normalized_hamming_distance(
+                                    m1.get_distance(),
+                                    m1.calc_length())
+                                coord_diff = PeptideMapping.calc_coord_diff(m1, query_from, query_to)
+                                of.write(m1.get_target_sequence())
+                                of.write("\t")
+                                of.write(str(m1.get_target_start()))
+                                of.write("\t")
+                                of.write(str(m1.get_target_end()))
+                                of.write("\t")
+                                of.write(str(norm_hamming))
+                                of.write("\t")
+                                of.write(str(m1.get_distance()))
+                                of.write("\t")
+                                of.write(str(m1.get_score()))
+                                of.write("\t")
+                                of.write(str(coord_diff))
+                                of.write("\t")
+                            else:
+                                of.write("")
+                                of.write("\t")
+                                of.write("")
+                                of.write("\t")
+                                of.write("")
+                                of.write("\t")
+                                of.write("")
+                                of.write("\t")
+                                of.write("")
+                                of.write("\t")
+                                of.write("")
+                                of.write("\t")
+                                of.write("")
+                                of.write("\t")
                             of.write(str(len(m)))
                             of.write("\n")
                         else:
@@ -177,6 +198,20 @@ class PeptideMapping(object):
                             of.write("\t")
                             of.write("")
                             of.write("\t")
+                            of.write("")
+                            of.write("\t")
+                            of.write("")
+                            of.write("\t")
+                            of.write("")
+                            of.write("\t")
+                            of.write("")
+                            of.write("\t")
+                            of.write("")
+                            of.write("\t")
+                            of.write("")
+                            of.write("\t")
+                            of.write("")
+                            of.write("\t")
                             of.write(str(len(m)))
                             of.write("\n")
 
@@ -184,6 +219,7 @@ class PeptideMapping(object):
                             for i, x in enumerate(m):
                                 norm = PeptideMapping.calc_inverted_normalized_hamming_distance(x.get_distance(),
                                                                                                 x.calc_length())
+                                print()
                                 print(str(i) + ": ")
                                 print("Hamming distance     : " + str(x.get_distance()))
                                 print("Norm Hamming distance: " + str(norm))
@@ -191,6 +227,11 @@ class PeptideMapping(object):
                                 print(x.to_aln())
                                 print("----------------------------------------")
         of.close()
+
+    @staticmethod
+    def calc_coord_diff(trgt_match, query_from, query_to):
+        return (trgt_match.get_target_start() + (trgt_match.get_target_end() - trgt_match.get_target_start()) / 2) - (
+                query_from + (query_to - query_from) / 2)
 
     @staticmethod
     def write_header(of):
@@ -204,19 +245,33 @@ class PeptideMapping(object):
         of.write("\t")
         of.write("QUERY FROM")
         of.write("\t")
-        of.write("TARGET SEQ")
+        of.write("TARGET SEQ (1)")
         of.write("\t")
-        of.write("TARGET FROM")
+        of.write("TARGET FROM (1)")
         of.write("\t")
-        of.write("TARGET TO")
+        of.write("TARGET TO (1)")
         of.write("\t")
-        of.write("NORM HAMMING DIST")
+        of.write("NORM HAMMING DIST (1)")
         of.write("\t")
-        of.write("DIST")
+        of.write("NONIDENTICAL AA (1)")
         of.write("\t")
-        of.write("SCORE")
+        of.write("SCORE (1)")
         of.write("\t")
-        of.write("COORD DIST")
+        of.write("COORD DIFF (1)")
+        of.write("\t")
+        of.write("TARGET SEQ (2)")
+        of.write("\t")
+        of.write("TARGET FROM (2)")
+        of.write("\t")
+        of.write("TARGET TO (2)")
+        of.write("\t")
+        of.write("NORM HAMMING DIST (2)")
+        of.write("\t")
+        of.write("NONIDENTICAL AA (2)")
+        of.write("\t")
+        of.write("SCORE (2)")
+        of.write("\t")
+        of.write("COORD DIFF (2)")
         of.write("\t")
         of.write("MATCH COUNT")
         of.write("\n")
@@ -224,7 +279,7 @@ class PeptideMapping(object):
 
 if __name__ == "__main__":
     # Example:
-    # % peptide_mapping -name S -md 12 -w 0.1 NL63_S.fasta SARS2.txt Spike_SARS2_to_NL63.txt
+    # % peptide_mapping -name S -md 13 -w 0.3 NL63_S.fasta SARS2.txt Spike_SARS2_to_NL63.txt
 
     argument_parser = ap.ArgumentParser(prog='peptide_mapping',
                                         description='transposition/mapping of peptide sequences')
@@ -239,19 +294,21 @@ if __name__ == "__main__":
     argument_parser.add_argument(dest='out_file', help='out file (example \'Spike_SARS2_to_NL63.txt\')',
                                  type=str)
 
-    argument_parser.add_argument('-md', dest='maximal_distance', help='maximal distance (default: 12)', type=int,
-                                 default=12)
+    argument_parser.add_argument('-md', dest='maximal_distance', help='maximal distance (default: 13)',
+                                 type=int,
+                                 default=13)
 
-    argument_parser.add_argument('-w', dest='coord_distance_weight', help='coordinate distance weight (default: 0.1)',
+    argument_parser.add_argument('-w', dest='coord_difference_weight',
+                                 help='coordinate difference weight (default: 0.3)',
                                  type=float,
-                                 default=0.1)
-
-    argument_parser.add_argument('-verbose', dest='verbose', help='verbose', type=bool,
-                                 default=False)
+                                 default=0.3)
 
     argument_parser.add_argument('-name', dest='protein_name', help='protein name (example \'S\')', type=str,
                                  required=True
                                  )
+
+    argument_parser.add_argument('-verbose', action='store_true', help='verbose')
+
     argument_parser.add_argument('--version', action='version', version='%(prog)s ' + PeptideMapping.VERSION)
 
     args = argument_parser.parse_args()
@@ -262,15 +319,15 @@ if __name__ == "__main__":
     md = args.maximal_distance
     pn = args.protein_name
     verb = args.verbose
-    coord_dist_weight = args.coord_distance_weight
+    coord_diff_weight = args.coord_difference_weight
 
-    print('Version               : ' + PeptideMapping.VERSION)
-    print('Protein name          : ' + str(pn))
-    print('Maximal distance      : ' + str(md))
-    print('Coord. distance weight: ' + str(coord_dist_weight))
-    print('Target sequence file  : ' + str(in_seq))
-    print('Query peptides file   : ' + str(in_tab))
-    print('Output                : ' + str(out_file))
+    print('Version                     : ' + PeptideMapping.VERSION)
+    print('Protein name                : ' + str(pn))
+    print('Maximal distance            : ' + str(md))
+    print('Coordinate difference weight: ' + str(coord_diff_weight))
+    print('Target sequence file        : ' + str(in_seq))
+    print('Query peptides file         : ' + str(in_tab))
+    print('Output                      : ' + str(out_file))
     print()
 
-    PeptideMapping.transpose(in_tab, in_seq, pn, out_file, md, coord_dist_weight, verb)
+    PeptideMapping.transpose(in_tab, in_seq, pn, out_file, md, coord_diff_weight, verb)
