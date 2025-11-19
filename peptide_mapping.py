@@ -23,7 +23,6 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 import argparse as ap
 import os
-import re
 import sys
 
 import fasta_parser
@@ -32,11 +31,6 @@ import target_match
 
 class PeptideMapping(object):
     VERSION = '1.0.1'
-
-    ID_RE = re.compile(">\\s*(.+)")
-    GAP_RE = re.compile("[-\\s]+")
-    WS_RE = re.compile("\\s+")
-    COMBINE_WHITESPACE_RE = re.compile(r"\s+")
 
     @staticmethod
     def perform_mapping_windowed(query, target, query_start, query_end, window_start, window_end):
