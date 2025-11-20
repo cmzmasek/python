@@ -43,7 +43,7 @@ class TargetMatch(object):
         self.__query_end = int(query_end)
         self.__target_start = int(target_start)
         self.__target_end = int(target_end)
-        self.__distance = int(distance)
+        self.__distance = float(distance)
         self.__score = float(score)
         self.__query_sequence = str(query_sequence)
         self.__target_sequence = str(target_sequence)

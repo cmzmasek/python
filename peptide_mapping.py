@@ -25,12 +25,14 @@ import argparse as ap
 import os
 import sys
 
+import amino_acid as aa
 import fasta_parser
 import target_match
 
 
 class PeptideMapping(object):
-    VERSION = '1.0.2'
+    VERSION = '1.0.3'
+    method = "hamming"
 
     @staticmethod
     def hamming_distance(s1, s2):
@@ -38,6 +40,36 @@ class PeptideMapping(object):
         if len(s1) != len(s2):
             raise ValueError("The strings must have the same length.")
         return sum(c1 != c2 for c1, c2 in zip(s1, s2))
+
+    @staticmethod
+    def simple_distance(s1, s2):
+        if len(s1) != len(s2):
+            raise ValueError("The strings must have the same length.")
+        d = 0
+        for c1, c2 in zip(s1, s2):
+            if c1 != c2:
+                if aa.AminoAcid.is_hydrophobic_non_aromatic(c1) and aa.AminoAcid.is_hydrophobic_non_aromatic(c2):
+                    d += 0.9
+                elif aa.AminoAcid.is_hydrophobic_aromatic(c1) and aa.AminoAcid.is_hydrophobic_aromatic(c2):
+                    d += 0.9
+                elif aa.AminoAcid.is_polar_uncharged(c1) and aa.AminoAcid.is_polar_uncharged(c2):
+                    d += 0.9
+                elif aa.AminoAcid.is_polar_positive(c1) and aa.AminoAcid.is_polar_positive(c2):
+                    d += 0.9
+                elif aa.AminoAcid.is_polar_negative(c1) and aa.AminoAcid.is_polar_negative(c2):
+                    d += 0.9
+                else:
+                    d += 1
+        return d
+
+    @staticmethod
+    def calculate_distance(s1, s2, method):
+        if method == 'hamming':
+            return PeptideMapping.hamming_distance(s1, s2)
+        elif method == 'simple':
+            return PeptideMapping.simple_distance(s1, s2)
+        else:
+            raise ValueError("Unknown method: " + method)
 
     @staticmethod
     def inverted_normalized_hamming_distance(s1, s2):
@@ -61,7 +93,7 @@ class PeptideMapping(object):
         query_len = len(query)
         for target_start in range(len(target) - query_len + 1):
             t = target[target_start:target_start + query_len]
-            dist = PeptideMapping.hamming_distance(t, query)
+            dist = PeptideMapping.calculate_distance(t, query, PeptideMapping.method)
             if dist <= max_dist:
                 target_end = target_start + query_len - 1
 
@@ -309,6 +341,9 @@ if __name__ == "__main__":
 
     argument_parser.add_argument('-verbose', action='store_true', help='verbose')
 
+    argument_parser.add_argument('--simple', action='store_true',
+                                 help='simple distance calculation, using basic chemistry')
+
     argument_parser.add_argument('--version', action='version', version='%(prog)s ' + PeptideMapping.VERSION)
 
     args = argument_parser.parse_args()
@@ -320,6 +355,8 @@ if __name__ == "__main__":
     pn = args.protein_name
     verb = args.verbose
     coord_diff_weight = args.coord_difference_weight
+    if args.simple:
+        PeptideMapping.method = "simple"
 
     print('Version                     : ' + PeptideMapping.VERSION)
     print('Protein name                : ' + str(pn))
@@ -327,6 +364,7 @@ if __name__ == "__main__":
     print('Coordinate difference weight: ' + str(coord_diff_weight))
     print('Target sequence file        : ' + str(in_seq))
     print('Query peptides file         : ' + str(in_tab))
+    print('Method                      : ' + str(PeptideMapping.method))
     print('Output                      : ' + str(out_file))
     print()
 
