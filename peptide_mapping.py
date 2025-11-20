@@ -31,7 +31,7 @@ import target_match
 
 
 class PeptideMapping(object):
-    VERSION = '1.0.3'
+    VERSION = '1.1.0'
     method = "hamming"
 
     @staticmethod
@@ -87,8 +87,9 @@ class PeptideMapping(object):
     @staticmethod
     def perform_mapping(query, target, query_start, query_end, max_dist, coord_distance_weight):
         if len(target) <= len(query):
+            print("t=" + target)
+            print("q=" + query)
             raise ValueError("Query must be shorter than target.")
-        # least_dist = len(query) + 1
         best_matches = []
         query_len = len(query)
         for target_start in range(len(target) - query_len + 1):
@@ -96,7 +97,6 @@ class PeptideMapping(object):
             dist = PeptideMapping.calculate_distance(t, query, PeptideMapping.method)
             if dist <= max_dist:
                 target_end = target_start + query_len - 1
-
                 query_center_coord = query_start + (query_end - query_start) / 2
                 target_center_coord = target_start + (target_end - target_start) / 2
                 score = PeptideMapping.calculate_score(dist, query_center_coord, target_center_coord,
@@ -108,7 +108,8 @@ class PeptideMapping(object):
         return best_matches
 
     @staticmethod
-    def transpose(in_table, seq_file, protein_name, outfile, max_dist, coord_distance_weight, verbose):
+    def transpose(in_table, seq_file, orf_name, outfile, max_dist, coord_distance_weight, adjust_coordinates,
+                  target_slice_from, target_slice_to, verbose):
 
         if os.path.isfile(outfile):
             print(outfile + ' already exists')
@@ -117,24 +118,39 @@ class PeptideMapping(object):
         seqs = fasta_parser.parse_fasta_file(seq_file, remove_gaps=True)
         seq = seqs[0]
         target_seq = seq.get_seq()
+        if target_slice_to > target_slice_from >= 0:
+            target_seq = target_seq[target_slice_from:target_slice_to + 1]
         of = open(outfile, 'w')
 
         PeptideMapping.write_header(of)
 
         with open(in_table, 'r') as file:
+            first = True
+            offset = 0
             for line in file:
                 line = line.strip()
                 if not line.startswith("#"):
                     values = line.split("\t")
                     query_seq = values[0]
-                    orf = values[1]
-                    protein = values[2]
+                    protein = values[1]
+                    orf = values[2]
                     query_from = int(values[3]) - 1
                     query_to = int(values[4]) - 1
 
-                    if protein == protein_name:
-                        m = PeptideMapping.perform_mapping(query_seq, target_seq, query_from, query_to, max_dist,
-                                                           coord_distance_weight)
+                    if orf == orf_name:
+                        query_from_orig = query_from
+                        query_to_orig = query_to
+                        if adjust_coordinates:
+                            if first:
+                                offset = query_from
+                                first = False
+                            query_from -= offset
+                            query_to -= offset
+
+                        m = []
+                        if len(target_seq) >= len(query_seq):
+                            m = PeptideMapping.perform_mapping(query_seq, target_seq, query_from, query_to, max_dist,
+                                                               coord_distance_weight)
                         if len(m) > 0:
                             m.sort()
                             m0 = m[0]
@@ -145,14 +161,24 @@ class PeptideMapping(object):
 
                             of.write(query_seq)
                             of.write("\t")
-                            of.write(protein_name)
+                            of.write(protein)
                             of.write("\t")
                             of.write(orf)
                             of.write("\t")
-                            of.write(str(query_from))
+                            of.write(str(query_from_orig))
                             of.write("\t")
-                            of.write(str(query_to))
+                            of.write(str(query_to_orig))
                             of.write("\t")
+                            if adjust_coordinates:
+                                of.write(str(query_from))
+                                of.write("\t")
+                                of.write(str(query_to))
+                                of.write("\t")
+                            else:
+                                of.write("")
+                                of.write("\t")
+                                of.write("")
+                                of.write("\t")
                             of.write(m0.get_target_sequence())
                             of.write("\t")
                             of.write(str(m0.get_target_start()))
@@ -167,7 +193,6 @@ class PeptideMapping(object):
                             of.write("\t")
                             of.write(str(coord_diff))
                             of.write("\t")
-
                             if len(m) > 1:
                                 m1 = m[1]
                                 norm_hamming = PeptideMapping.calc_inverted_normalized_hamming_distance(
@@ -208,13 +233,17 @@ class PeptideMapping(object):
                         else:
                             of.write(query_seq)
                             of.write("\t")
-                            of.write(protein_name)
+                            of.write(protein)
                             of.write("\t")
                             of.write(orf)
                             of.write("\t")
-                            of.write(str(query_from))
+                            of.write(str(query_from_orig))
                             of.write("\t")
-                            of.write(str(query_to))
+                            of.write(str(query_to_orig))
+                            of.write("\t")
+                            of.write("")
+                            of.write("\t")
+                            of.write("")
                             of.write("\t")
                             of.write("")
                             of.write("\t")
@@ -246,6 +275,7 @@ class PeptideMapping(object):
                             of.write("\t")
                             of.write(str(len(m)))
                             of.write("\n")
+                            of.flush()
 
                         if verbose:
                             for i, x in enumerate(m):
@@ -275,7 +305,11 @@ class PeptideMapping(object):
         of.write("\t")
         of.write("QUERY FROM")
         of.write("\t")
-        of.write("QUERY FROM")
+        of.write("QUERY TO")
+        of.write("\t")
+        of.write("ADJ QUERY FROM")
+        of.write("\t")
+        of.write("ADJ QUERY TO")
         of.write("\t")
         of.write("TARGET SEQ (1)")
         of.write("\t")
@@ -310,8 +344,11 @@ class PeptideMapping(object):
 
 
 if __name__ == "__main__":
-    # Example:
+    # Examples:
     # % peptide_mapping -name S -md 13 -w 0.3 NL63_S.fasta SARS2.txt Spike_SARS2_to_NL63.txt
+    #
+    # % peptide_mapping -name nsp12 -md 13 -w 0.3 -adj_start -target_from 4056 -target_to 4925
+    #   YP_003766_2_ORF1ab_Human_coronavirus_NL63.fasta SARS2.txt nsp12_SARS2_to_NL63.txt
 
     argument_parser = ap.ArgumentParser(prog='peptide_mapping',
                                         description='transposition/mapping of peptide sequences')
@@ -335,9 +372,18 @@ if __name__ == "__main__":
                                  type=float,
                                  default=0.3)
 
-    argument_parser.add_argument('-name', dest='protein_name', help='protein name (example \'S\')', type=str,
+    argument_parser.add_argument('-name', dest='orf_name', help='orf name (example \'S\')', type=str,
                                  required=True
                                  )
+    argument_parser.add_argument('-target_from', dest='target_from', help='first aa position for target slice',
+                                 type=int,
+                                 default=-1, required=False)
+
+    argument_parser.add_argument('-target_to', dest='target_to', help='last aa position for target slice',
+                                 type=int,
+                                 default=-1, required=False)
+
+    argument_parser.add_argument('-adj_start', action='store_true', help='adjust first query coordinate to 0')
 
     argument_parser.add_argument('-verbose', action='store_true', help='verbose')
 
@@ -352,20 +398,33 @@ if __name__ == "__main__":
     in_tab = args.in_tab
     out_file = args.out_file
     md = args.maximal_distance
-    pn = args.protein_name
+    on = args.orf_name
+    zs = args.adj_start
+    tf = args.target_from
+    tt = args.target_to
     verb = args.verbose
     coord_diff_weight = args.coord_difference_weight
     if args.simple:
         PeptideMapping.method = "simple"
 
+    if tf >= 0 or tt >= 0:
+        if not (tt > tf >= 0):
+            print('first/last aa positions for target slice are out of range')
+            sys.exit()
+
     print('Version                     : ' + PeptideMapping.VERSION)
-    print('Protein name                : ' + str(pn))
+    print('ORF name                    : ' + str(on))
     print('Maximal distance            : ' + str(md))
     print('Coordinate difference weight: ' + str(coord_diff_weight))
     print('Target sequence file        : ' + str(in_seq))
     print('Query peptides file         : ' + str(in_tab))
     print('Method                      : ' + str(PeptideMapping.method))
+    if zs:
+        print('Adjust start                : true')
+    if tf >= 0 or tt >= 0:
+        print('Target slice from           : ' + str(tf))
+        print('Target slice to             : ' + str(tt))
     print('Output                      : ' + str(out_file))
     print()
 
-    PeptideMapping.transpose(in_tab, in_seq, pn, out_file, md, coord_diff_weight, verb)
+    PeptideMapping.transpose(in_tab, in_seq, on, out_file, md, coord_diff_weight, zs, tf, tt, verb)
