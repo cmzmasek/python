@@ -36,9 +36,9 @@ class TargetMatch(object):
         if target_end - target_start != query_end - query_start:
             raise ValueError("Query and target must have same length by coordinates.")
         if target_end - target_start + 1 != len(target_sequence):
-            raise ValueError("Target sequence length does not much length by coordinates")
+            raise ValueError("Target sequence length does not match length by coordinates")
         if query_end - query_start + 1 != len(query_sequence):
-            raise ValueError("Query sequence length does not much length by coordinates")
+            raise ValueError("Query sequence length does not match length by coordinates")
         self.__query_start = int(query_start)
         self.__query_end = int(query_end)
         self.__target_start = int(target_start)
