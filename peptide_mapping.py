@@ -299,8 +299,9 @@ class PeptideMapping(object):
 
     @staticmethod
     def calc_coord_diff(trgt_match, query_from, query_to):
-        return (trgt_match.get_target_start() + (trgt_match.get_target_end() - trgt_match.get_target_start()) / 2) - (
-                query_from + (query_to - query_from) / 2)
+        return int(
+            (trgt_match.get_target_start() + (trgt_match.get_target_end() - trgt_match.get_target_start()) / 2) - (
+                    query_from + (query_to - query_from) / 2))
 
     @staticmethod
     def write_header(of):
