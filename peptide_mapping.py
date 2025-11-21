@@ -118,6 +118,13 @@ class PeptideMapping(object):
         seqs = fasta_parser.parse_fasta_file(seq_file, remove_gaps=True)
         seq = seqs[0]
         target_seq = seq.get_seq()
+
+        if target_slice_from >= 0 or target_slice_to >= 0:
+            if target_slice_from < 0 or target_slice_to < 0 or target_slice_from >= target_slice_to or \
+                    target_slice_to >= len(target_seq):
+                print('target slice from/to values are out of range: ' + str(target_slice_from) + ", " + str(
+                    target_slice_to))
+                sys.exit()
         if target_slice_to > target_slice_from >= 0:
             target_seq = target_seq[target_slice_from:target_slice_to + 1]
         of = open(outfile, 'w')
