@@ -31,7 +31,7 @@ import molseq
 
 
 class CleanFasta(object):
-    VERSION = '1.0.2'
+    VERSION = '1.0.3'
 
     ID_RE = re.compile(">\\s*(.+)")
     GAP_RE = re.compile("[-\\s]+")
@@ -60,7 +60,7 @@ class CleanFasta(object):
             yield molseq.MolSeq(seq_id, "".join(seq))
 
     @staticmethod
-    def clean_mol_seqs(infile, outfile, min_length, min_ratio, aa, unique_ids):
+    def clean_mol_seqs(infile, outfile, min_length, min_ratio, aa, unique_ids, max_length=-1):
 
         if os.path.isfile(outfile):
             print(outfile + ' already exists')
@@ -71,7 +71,8 @@ class CleanFasta(object):
 
         total = 0
         ignored_irr_chars = 0
-        ignored_length = 0
+        ignored_length_too_short = 0
+        ignored_length_too_long = 0
         ignored_name = 0
         ignored_numbers = 0
         ignored_identical_id = 0
@@ -86,7 +87,11 @@ class CleanFasta(object):
                     ignored_numbers += 1
                 else:
                     length = seq.get_length()
-                    if length >= min_length:
+                    if length < min_length:
+                        ignored_length_too_short += 1
+                    elif min_length < max_length < length:
+                        ignored_length_too_long += 1
+                    else:
                         if aa:
                             reg = length - seq.count_irregular_chars_aa()
                         else:
@@ -105,8 +110,8 @@ class CleanFasta(object):
                                 passed += 1
                         else:
                             ignored_irr_chars += 1
-                    else:
-                        ignored_length += 1
+
+
             else:
                 ignored_name += 1
                 print('Ignored because empty id:')
@@ -114,14 +119,16 @@ class CleanFasta(object):
 
         f0.close()
         f1.close()
-        print('Input                 : ' + str(total))
-        print('Ignored no name       : ' + str(ignored_name))
-        print('Ignored numbers in seq: ' + str(ignored_numbers))
-        print('Ignored length        : ' + str(ignored_length))
-        print('Ignored irreg chars   : ' + str(ignored_irr_chars))
-        print('Ignored identical ids : ' + str(ignored_identical_id))
-        print('Passed                : ' + str(passed))
-        print('Wrote to              : ' + str(outfile))
+        print('Version                   : ' + CleanFasta.VERSION)
+        print('Input                     : ' + str(total))
+        print('Ignored no name           : ' + str(ignored_name))
+        print('Ignored numbers in seq    : ' + str(ignored_numbers))
+        print('Ignored length (too short): ' + str(ignored_length_too_short))
+        print('Ignored length (too long) : ' + str(ignored_length_too_long))
+        print('Ignored irreg chars       : ' + str(ignored_irr_chars))
+        print('Ignored identical ids     : ' + str(ignored_identical_id))
+        print('Passed                    : ' + str(passed))
+        print('Wrote to                  : ' + str(outfile))
 
 
 if __name__ == "__main__":
@@ -136,6 +143,9 @@ if __name__ == "__main__":
     argument_parser.add_argument('-ml', dest='minimal_length', help='minimal length (default: 20)', type=int,
                                  default=20)
 
+    argument_parser.add_argument('-mal', dest='maximal_length', help='maximal length', type=int,
+                                 default=-1)
+
     argument_parser.add_argument('-r', dest='ratio', help='valid char ratio(default: 0.99)', type=float, default=0.99)
 
     argument_parser.add_argument('-t', dest='type', help='aa or na (default: aa)', type=str, default='aa')
@@ -149,6 +159,7 @@ if __name__ == "__main__":
     in_file = args.in_file
     out_file = args.out_file
     ml = args.minimal_length
+    mal = args.maximal_length
     ra = args.ratio
     t_str = args.type
     u_str = args.unique_ids
@@ -162,6 +173,8 @@ if __name__ == "__main__":
         u_id = False
 
     print('Minimal length        : ' + str(ml))
+    if mal > ml:
+        print('Maximal length        : ' + str(mal))
     print('Valid char ratio      : ' + str(ra))
     if amino:
         print('Type                  : AA')
@@ -179,5 +192,6 @@ if __name__ == "__main__":
         ml,
         ra,
         amino,
-        u_id
+        u_id,
+        mal
     )
