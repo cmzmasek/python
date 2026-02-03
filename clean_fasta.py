@@ -31,7 +31,7 @@ import molseq
 
 
 class CleanFasta(object):
-    VERSION = '1.0.3'
+    VERSION = '1.0.4'
 
     ID_RE = re.compile(">\\s*(.+)")
     GAP_RE = re.compile("[-\\s]+")
@@ -77,16 +77,28 @@ class CleanFasta(object):
         ignored_numbers = 0
         ignored_identical_id = 0
         passed = 0
+        min_length_input = -1
+        max_length_input = -1
+        sum_length_input = -1
+
+        min_r_passing = 1
+        max_r_passing = 0
+
         ids = set()
 
         for seq in CleanFasta.stream_fasta(f0, True):
             total += 1
             seq_name = seq.get_seq_id().strip()
+            length = seq.get_length()
+            if length > max_length_input:
+                max_length_input = length
+            if min_length_input < 0 or length < min_length_input:
+                min_length_input = length
+            sum_length_input += length
             if len(seq_name) > 0:
                 if re.search(r'\d', seq.get_seq()):
                     ignored_numbers += 1
                 else:
-                    length = seq.get_length()
                     if length < min_length:
                         ignored_length_too_short += 1
                     elif min_length < max_length < length:
@@ -97,7 +109,10 @@ class CleanFasta(object):
                         else:
                             reg = seq.count_regular_chars_na()
                         r = reg / length
-
+                        if r < min_r_passing:
+                            min_r_passing = r
+                        if r > max_r_passing:
+                            max_r_passing = r
                         if r >= min_ratio:
                             nn = CleanFasta.COMBINE_WHITESPACE_RE.sub(' ', seq_name).strip()
                             if unique_ids and nn in ids:
@@ -121,12 +136,17 @@ class CleanFasta(object):
         f1.close()
         print('Version                   : ' + CleanFasta.VERSION)
         print('Input                     : ' + str(total))
+        print('    Min length            : ' + str(min_length_input))
+        print('    Max length            : ' + str(max_length_input))
+        print('    Average lenth         : ' + str(sum_length_input / total))
         print('Ignored no name           : ' + str(ignored_name))
         print('Ignored numbers in seq    : ' + str(ignored_numbers))
         print('Ignored length (too short): ' + str(ignored_length_too_short))
         print('Ignored length (too long) : ' + str(ignored_length_too_long))
         print('Ignored irreg chars       : ' + str(ignored_irr_chars))
         print('Ignored identical ids     : ' + str(ignored_identical_id))
+        print('    Min r                 : ' + str(min_r_passing))
+        print('    Max r                 : ' + str(max_r_passing))
         print('Passed                    : ' + str(passed))
         print('Wrote to                  : ' + str(outfile))
 
