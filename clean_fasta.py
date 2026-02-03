@@ -79,7 +79,7 @@ class CleanFasta(object):
         passed = 0
         min_length_input = -1
         max_length_input = -1
-        sum_length_input = -1
+        sum_length_input = 0
 
         min_r_passing = 1
         max_r_passing = 0
