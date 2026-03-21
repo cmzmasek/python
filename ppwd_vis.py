@@ -7,10 +7,12 @@ Supports:
   • Classical (Hamming / p-distance, Jukes-Cantor, Kimura)
   • Cosine  (one-hot, physicochemical, BLOSUM62-embedding, k-mer frequency)
   • Optional TSV label replacement file (2-column: original_id → display_label)
+  • Heatmap output as PNG, PDF, SVG, or all formats simultaneously
 """
 
 import argparse
 import csv
+import datetime
 import json
 import os
 import sys
@@ -18,6 +20,7 @@ import warnings
 from collections import Counter
 from dataclasses import dataclass
 from itertools import combinations
+from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Callable
 
 import matplotlib.patches as mpatches
@@ -27,6 +30,7 @@ from Bio import AlignIO
 from Bio.Align import MultipleSeqAlignment, substitution_matrices
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
+from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.gridspec import GridSpec
 from scipy.cluster.hierarchy import (
     dendrogram, linkage, optimal_leaf_ordering, leaves_list, fcluster,
@@ -36,6 +40,202 @@ from scipy.stats import pearsonr, spearmanr
 
 warnings.filterwarnings("ignore")
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  OUTPUT FORMAT MANAGER
+# ══════════════════════════════════════════════════════════════════════════════
+
+SUPPORTED_FORMATS = ["png", "pdf", "svg", "all"]
+
+
+class FigureExporter:
+    """
+    Handles saving matplotlib figures to one or more output formats.
+
+    Supported formats : png, pdf, svg, all (= png + pdf + svg)
+
+    PDF behaviour
+    ─────────────
+    • Single method  → one PDF file per figure.
+    • Multi-page PDF → enabled by passing a shared PdfPages object via
+                       begin_pdf() / end_pdf(); all subsequent save() calls
+                       append pages to the same file.
+    • Metadata       → author, creation date, and figure title are embedded
+                       in PDF metadata automatically.
+
+    Usage (single figure)
+    ─────────────────────
+        exporter = FigureExporter(fmt="pdf", dpi=150)
+        exporter.save(fig, "output/heatmap", title="My Heatmap")
+
+    Usage (multi-page PDF)
+    ──────────────────────
+        exporter = FigureExporter(fmt="pdf")
+        exporter.begin_multipage_pdf("output/report.pdf")
+        exporter.save(fig1, title="Figure 1")
+        exporter.save(fig2, title="Figure 2")
+        exporter.end_multipage_pdf()
+    """
+
+    def __init__(
+            self,
+            fmt: str = "png",
+            dpi: int = 150,
+            transparent: bool = False,
+            facecolor: str = "white",
+    ):
+        fmt = fmt.lower()
+        if fmt not in SUPPORTED_FORMATS:
+            raise ValueError(
+                f"Unsupported format '{fmt}'. "
+                f"Choose from: {SUPPORTED_FORMATS}"
+            )
+        self.fmt = fmt
+        self.dpi = dpi
+        self.transparent = transparent
+        self.facecolor = facecolor
+
+        # Multi-page PDF state
+        self._pdf_pages: Optional[PdfPages] = None
+        self._pdf_path: Optional[str] = None
+        self._page_count: int = 0
+
+    # ── multi-page PDF context ────────────────────────────────────────────────
+
+    def begin_multipage_pdf(self, path: str) -> None:
+        """Open a PdfPages object for multi-page PDF output."""
+        if self._pdf_pages is not None:
+            raise RuntimeError("A multi-page PDF is already open. Call end_multipage_pdf() first.")
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        metadata = {
+            "Author": "protein_distances pipeline",
+            "Creator": "matplotlib / PdfPages",
+            "Subject": "Protein pairwise distance analysis",
+            "CreationDate": datetime.datetime.now(),
+        }
+        self._pdf_pages = PdfPages(path, metadata=metadata)
+        self._pdf_path = path
+        self._page_count = 0
+        print(f"  ✓  Multi-page PDF opened → {path}")
+
+    def end_multipage_pdf(self) -> None:
+        """Close and finalise the multi-page PDF."""
+        if self._pdf_pages is None:
+            return
+        self._pdf_pages.close()
+        print(f"  ✓  Multi-page PDF closed ({self._page_count} page(s)) → {self._pdf_path}")
+        self._pdf_pages = None
+        self._pdf_path = None
+        self._page_count = 0
+
+    # context-manager support
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.end_multipage_pdf()
+
+    # ── main save method ──────────────────────────────────────────────────────
+
+    def save(
+            self,
+            fig: plt.Figure,
+            base_path: Optional[str] = None,
+            title: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Save *fig* to disk.
+
+        Parameters
+        ──────────
+        fig        : matplotlib Figure to save.
+        base_path  : File path WITHOUT extension. Required unless a multi-page
+                     PDF is active (in which case the figure is appended there).
+        title      : Embedded in PDF page metadata when using PdfPages.
+
+        Returns
+        ───────
+        List of file paths that were written.
+        """
+        saved: List[str] = []
+
+        # If multi-page PDF is open, always append there regardless of fmt
+        if self._pdf_pages is not None:
+            self._pdf_pages.savefig(
+                fig,
+                dpi=self.dpi,
+                bbox_inches="tight",
+                facecolor=self.facecolor,
+                transparent=self.transparent,
+                metadata={"Title": title or ""} if title else None,
+            )
+            self._page_count += 1
+            saved.append(f"{self._pdf_path} (page {self._page_count})")
+            return saved
+
+        # ── standalone save ───────────────────────────────────────────────────
+        if base_path is None:
+            raise ValueError("base_path is required when not using multi-page PDF mode.")
+
+        Path(base_path).parent.mkdir(parents=True, exist_ok=True)
+
+        formats_to_write = (
+            ["png", "pdf", "svg"] if self.fmt == "all"
+            else [self.fmt]
+        )
+
+        for ext in formats_to_write:
+            out = f"{base_path}.{ext}"
+            kwargs: Dict = dict(
+                dpi=self.dpi,
+                bbox_inches="tight",
+                facecolor=self.facecolor,
+                transparent=self.transparent,
+            )
+            if ext == "pdf":
+                # Embed metadata in standalone PDF
+                kwargs["metadata"] = self._pdf_metadata(title or Path(base_path).name)
+            fig.savefig(out, format=ext, **kwargs)
+            saved.append(out)
+
+        return saved
+
+    def save_and_report(
+            self,
+            fig: plt.Figure,
+            base_path: Optional[str],
+            label: str,
+            title: Optional[str] = None,
+    ) -> List[str]:
+        """save() + print confirmation lines."""
+        paths = self.save(fig, base_path, title=title)
+        for p in paths:
+            print(f"  ✓  {label} → {p}")
+        return paths
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _pdf_metadata(title: str) -> Dict[str, str]:
+        return {
+            "Title": title,
+            "Author": "protein_distances pipeline",
+            "Creator": "matplotlib",
+            "Subject": "Protein pairwise distance heatmap",
+            "CreationDate": datetime.datetime.now().strftime("%Y%m%d%H%M%S"),
+        }
+
+    @property
+    def extension(self) -> str:
+        """Primary extension (first format if 'all')."""
+        return "png" if self.fmt == "all" else self.fmt
+
+    def extensions(self) -> List[str]:
+        return ["png", "pdf", "svg"] if self.fmt == "all" else [self.fmt]
+
+    def describe(self) -> str:
+        exts = self.extensions()
+        return f"Format: {self.fmt.upper()}  →  {' + '.join(e.upper() for e in exts)}"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TSV LABEL MANAGER
@@ -43,50 +243,44 @@ warnings.filterwarnings("ignore")
 
 class LabelManager:
     """
-    Loads an optional two-column TSV file that maps original sequence IDs
+    Loads an optional two-column TSV file mapping original sequence IDs
     to user-friendly display labels.
 
-    TSV format (no header required, but header lines starting with '#' are
-    skipped; a header row whose first token is 'id'/'seq_id'/'original' is
-    also auto-detected and skipped):
-
-        SequenceID_1    Human hemoglobin alpha
-        SequenceID_2    Mouse hemoglobin alpha
-        # this is a comment
-        SequenceID_3    Zebrafish hemoglobin alpha
+    TSV format
+    ──────────
+    # comment
+    original_id<TAB>display_label
+    SeqID_001<TAB>Homo sapiens hemoglobin alpha
 
     Rules
     ─────
-    • Delimiter: tab (default) or any whitespace run.
-    • Lines with fewer than 2 fields are warned about and skipped.
-    • Duplicate original IDs → last entry wins (with warning).
-    • Sequence IDs NOT in the TSV keep their original ID unchanged.
-    • Leading/trailing whitespace in both columns is stripped.
-    • BOM characters (UTF-8 with BOM files) are handled transparently.
+    • Lines starting with '#' are skipped.
+    • Header row auto-detected if first token is id/seq_id/original/name/label.
+    • IDs not present in the TSV keep their original name.
+    • Duplicate original IDs → last entry wins (warning printed).
+    • BOM characters stripped transparently.
     """
 
+    _HEADER_TOKENS = {"id", "seq_id", "original", "sequence_id", "name", "label", "original_id"}
+
     def __init__(self, tsv_path: Optional[str] = None, delimiter: str = "\t"):
-        self._map: Dict[str, str] = {}  # original_id  → display_label
-        self._reverse: Dict[str, str] = {}  # display_label → original_id
+        self._map: Dict[str, str] = {}
+        self._reverse: Dict[str, str] = {}
         self._path = tsv_path
-        self._delimiter = delimiter
         self._loaded = False
 
         if tsv_path:
             self._load(tsv_path, delimiter)
 
-    # ── public API ────────────────────────────────────────────────────────────
+    # ── public ────────────────────────────────────────────────────────────────
 
     def replace(self, original_id: str) -> str:
-        """Return display label for *original_id*, or the id itself if not mapped."""
         return self._map.get(original_id.strip(), original_id.strip())
 
     def replace_all(self, ids: List[str]) -> List[str]:
-        """Map a list of original IDs to display labels."""
         return [self.replace(i) for i in ids]
 
     def original(self, display_label: str) -> str:
-        """Reverse lookup: display label → original ID."""
         return self._reverse.get(display_label, display_label)
 
     @property
@@ -99,27 +293,23 @@ class LabelManager:
 
     def summary(self) -> str:
         if not self._loaded:
-            return "  LabelManager: no TSV file loaded – using original IDs."
-        lines = [
-            f"  LabelManager: loaded {self.n_mappings} label(s) from '{self._path}'",
-        ]
-        for orig, label in self._map.items():
-            lines.append(f"    {orig!r:40s} → {label!r}")
+            return "  LabelManager: no TSV loaded – using original IDs."
+        lines = [f"  LabelManager: {self.n_mappings} label(s) from '{self._path}'"]
+        for orig, lbl in self._map.items():
+            lines.append(f"    {orig!r:40s} → {lbl!r}")
         return "\n".join(lines)
 
     def validate_against_alignment(self, alignment: MultipleSeqAlignment) -> None:
-        """Warn about TSV IDs that do not appear in the alignment."""
         if not self._loaded:
             return
         aln_ids = {rec.id for rec in alignment}
         missing = set(self._map) - aln_ids
         if missing:
-            print(f"  ⚠  TSV label warning: the following original IDs were not "
-                  f"found in the alignment (they will be ignored):")
+            print("  ⚠  TSV IDs not found in alignment (ignored):")
             for m in sorted(missing):
                 print(f"       '{m}'")
         matched = len(self._map) - len(missing)
-        print(f"  ✓  TSV labels: {matched}/{len(self._map)} IDs matched in alignment.")
+        print(f"  ✓  TSV: {matched}/{len(self._map)} IDs matched.")
 
     # ── private ───────────────────────────────────────────────────────────────
 
@@ -127,65 +317,43 @@ class LabelManager:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Label TSV not found: '{path}'")
 
-        # Auto-detect header keywords
-        HEADER_KEYWORDS = {"id", "seq_id", "original", "sequence_id",
-                           "name", "label", "original_id"}
-
-        n_skipped = 0
-        n_duplicate = 0
-        n_loaded = 0
-
-        with open(path, "r", encoding="utf-8-sig") as fh:  # utf-8-sig strips BOM
-            for lineno, raw in enumerate(fh, start=1):
+        n_loaded = n_skipped = n_dup = 0
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            for lineno, raw in enumerate(fh, 1):
                 line = raw.rstrip("\n\r")
-
-                # Skip blank lines and comment lines
                 if not line.strip() or line.lstrip().startswith("#"):
                     continue
-
-                # Split
-                parts = line.split(delimiter) if delimiter == "\t" else line.split()
-                parts = [p.strip() for p in parts]
-
-                # Skip header row (first non-comment line if it looks like a header)
-                if lineno == 1 and parts[0].lower() in HEADER_KEYWORDS:
+                parts = [p.strip() for p in line.split(delimiter)]
+                if lineno == 1 and parts[0].lower() in self._HEADER_TOKENS:
                     continue
-
                 if len(parts) < 2:
-                    print(f"  ⚠  TSV line {lineno}: expected 2 columns, "
-                          f"got {len(parts)} – skipped.")
+                    print(f"  ⚠  TSV line {lineno}: <2 columns – skipped.")
                     n_skipped += 1
                     continue
-
-                orig_id = parts[0]
-                disp_lbl = parts[1]  # only first two columns used; rest ignored
-
-                if orig_id in self._map:
-                    print(f"  ⚠  TSV line {lineno}: duplicate original ID "
-                          f"'{orig_id}' – overwriting previous entry.")
-                    n_duplicate += 1
-
-                self._map[orig_id] = disp_lbl
-                self._reverse[disp_lbl] = orig_id
+                orig, disp = parts[0], parts[1]
+                if orig in self._map:
+                    print(f"  ⚠  TSV line {lineno}: duplicate '{orig}' – overwriting.")
+                    n_dup += 1
+                self._map[orig] = disp
+                self._reverse[disp] = orig
                 n_loaded += 1
 
-        if n_loaded == 0:
-            print(f"  ⚠  TSV file '{path}' contained no valid mappings.")
-        else:
+        if n_loaded:
             self._loaded = True
-            print(f"  ✓  TSV labels loaded: {n_loaded} mappings "
-                  f"({n_skipped} skipped, {n_duplicate} duplicates)")
+            print(f"  ✓  TSV loaded: {n_loaded} mappings "
+                  f"({n_skipped} skipped, {n_dup} duplicates)")
+        else:
+            print(f"  ⚠  TSV '{path}' contained no valid mappings.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  AMINO ACID PROPERTY TABLES
+#  AMINO ACID PROPERTIES
 # ══════════════════════════════════════════════════════════════════════════════
 
 AA_ORDER = list("ACDEFGHIKLMNPQRSTVWY")
 AA_INDEX = {aa: i for i, aa in enumerate(AA_ORDER)}
 
 _RAW_PHYSICOCHEMICAL: Dict[str, List[float]] = {
-    #          hydro    vol    polar   pK      pro    chg    arom
     "A": [1.8, 88.6, 0.00, 0.0, 0.0, 0.0, 0.0],
     "C": [2.5, 108.5, 1.48, 8.3, 0.0, 0.0, 0.0],
     "D": [-3.5, 111.1, 49.70, 3.9, 0.0, -1.0, 0.0],
@@ -214,8 +382,7 @@ def _normalise_columns(raw: Dict[str, List[float]]) -> Dict[str, np.ndarray]:
     lo, hi = mat.min(0), mat.max(0)
     d = hi - lo;
     d[d == 0] = 1.0
-    mat = (mat - lo) / d
-    return {aa: mat[i] for i, aa in enumerate(AA_ORDER)}
+    return {aa: (mat[i] - lo) / d for i, aa in enumerate(AA_ORDER)}
 
 
 PHYSICOCHEMICAL: Dict[str, np.ndarray] = _normalise_columns(_RAW_PHYSICOCHEMICAL)
@@ -231,12 +398,8 @@ def _one_hot(aa: str) -> np.ndarray:
 def _build_blosum62_embedding() -> Dict[str, np.ndarray]:
     try:
         mat = substitution_matrices.load("BLOSUM62")
-        return {
-            aa: np.array([
-                float(mat[aa][other]) for other in AA_ORDER
-            ], dtype=float)
-            for aa in AA_ORDER
-        }
+        return {aa: np.array([float(mat[aa][o]) for o in AA_ORDER], dtype=float)
+                for aa in AA_ORDER}
     except Exception:
         return {aa: _one_hot(aa) for aa in AA_ORDER}
 
@@ -253,7 +416,7 @@ class SequenceEncoder:
 
     def __init__(self, scheme: str = "physicochemical", k: int = 2):
         if scheme not in self.SCHEMES:
-            raise ValueError(f"Unknown scheme '{scheme}'. Choose: {self.SCHEMES}")
+            raise ValueError(f"Unknown scheme '{scheme}'.")
         self.scheme = scheme
         self.k = k
         self._kmer_vocab: Optional[List[str]] = None
@@ -269,7 +432,7 @@ class SequenceEncoder:
         elif self.scheme == "kmer_freq":
             return self._kmer_encode(seq)
 
-    def build_vocab(self, sequences: List[str]):
+    def build_vocab(self, sequences: List[str]) -> None:
         kmers: set = set()
         for s in sequences:
             clean = s.upper().replace("-", "")
@@ -279,9 +442,7 @@ class SequenceEncoder:
 
     @staticmethod
     def _pos_encode(seq: str, fn: Callable, dim: int) -> np.ndarray:
-        return np.concatenate([
-            np.zeros(dim) if aa == "-" else fn(aa) for aa in seq
-        ])
+        return np.concatenate([np.zeros(dim) if aa == "-" else fn(aa) for aa in seq])
 
     def _kmer_encode(self, seq: str) -> np.ndarray:
         clean = seq.replace("-", "")
@@ -297,13 +458,7 @@ class SequenceEncoder:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CosineDistanceEngine:
-    """
-    1 - cosine_similarity between encoded sequence vectors.
-    distance ∈ [0, 1].
-    """
-
-    def __init__(self, scheme: str = "physicochemical", k: int = 2,
-                 normalise: bool = True):
+    def __init__(self, scheme: str = "physicochemical", k: int = 2, normalise: bool = True):
         self.scheme = scheme
         self.k = k
         self.normalise = normalise
@@ -313,14 +468,11 @@ class CosineDistanceEngine:
         seqs = [str(rec.seq) for rec in alignment]
         if self.scheme == "kmer_freq":
             self.encoder.build_vocab(seqs)
-
         vectors = np.array([self.encoder.encode(s) for s in seqs], dtype=float)
-
         if self.normalise and self.scheme != "kmer_freq":
             norms = np.linalg.norm(vectors, axis=1, keepdims=True)
             norms[norms == 0] = 1.0
             vectors /= norms
-
         n = len(vectors)
         D = np.zeros((n, n), dtype=float)
         for i, j in combinations(range(n), 2):
@@ -345,29 +497,25 @@ class MatrixInfo:
 
 
 MATRIX_REGISTRY: Dict[str, MatrixInfo] = {
-    # PAM
     "PAM40": MatrixInfo("PAM40", "PAM", "PAM40", "PAM40  – very close (~85–90% id)", "~85–90%"),
     "PAM80": MatrixInfo("PAM80", "PAM", "PAM80", "PAM80  – close (~75–85% id)", "~75–85%"),
     "PAM120": MatrixInfo("PAM120", "PAM", "PAM120", "PAM120 – moderate (~65–75% id)", "~65–75%"),
     "PAM160": MatrixInfo("PAM160", "PAM", "PAM160", "PAM160 – distant (~50–65% id)", "~50–65%"),
     "PAM200": MatrixInfo("PAM200", "PAM", "PAM200", "PAM200 – distant (~40–55% id)", "~40–55%"),
     "PAM250": MatrixInfo("PAM250", "PAM", "PAM250", "PAM250 – very distant (<40% id)", "<40%"),
-    # BLOSUM
     "BLOSUM30": MatrixInfo("BLOSUM30", "BLOSUM", "BLOSUM30", "BLOSUM30 – very distant (<30% id)", "<30%"),
     "BLOSUM45": MatrixInfo("BLOSUM45", "BLOSUM", "BLOSUM45", "BLOSUM45 – distant (~30–40% id)", "~30–40%"),
     "BLOSUM50": MatrixInfo("BLOSUM50", "BLOSUM", "BLOSUM50", "BLOSUM50 – moderate (~40–50% id)", "~40–50%"),
-    "BLOSUM62": MatrixInfo("BLOSUM62", "BLOSUM", "BLOSUM62", "BLOSUM62 – general purpose (~50–62% id)", "~50–62%"),
+    "BLOSUM62": MatrixInfo("BLOSUM62", "BLOSUM", "BLOSUM62", "BLOSUM62 – general (~50–62% id)", "~50–62%"),
     "BLOSUM80": MatrixInfo("BLOSUM80", "BLOSUM", "BLOSUM80", "BLOSUM80 – close (~80% id)", "~80%"),
     "BLOSUM90": MatrixInfo("BLOSUM90", "BLOSUM", "BLOSUM90", "BLOSUM90 – very close (>90% id)", ">90%"),
-    # Classical
-    "hamming": MatrixInfo("hamming", "classical", "", "p-distance (fraction different sites)", "any"),
-    "jukes_cantor": MatrixInfo("jukes_cantor", "classical", "", "Jukes-Cantor 20-state correction", "any"),
-    "kimura": MatrixInfo("kimura", "classical", "", "Kimura empirical protein distance", "any"),
-    # Cosine
-    "cosine_onehot": MatrixInfo("cosine_onehot", "cosine", "", "Cosine – one-hot encoded positions", "any"),
-    "cosine_physico": MatrixInfo("cosine_physico", "cosine", "", "Cosine – 7-property physicochemical vectors", "any"),
-    "cosine_blosum": MatrixInfo("cosine_blosum", "cosine", "", "Cosine – BLOSUM62-row embeddings", "any"),
-    "cosine_kmer": MatrixInfo("cosine_kmer", "cosine", "", "Cosine – k-mer frequency profiles", "any"),
+    "hamming": MatrixInfo("hamming", "classical", "", "p-distance", "any"),
+    "jukes_cantor": MatrixInfo("jukes_cantor", "classical", "", "Jukes-Cantor 20-state", "any"),
+    "kimura": MatrixInfo("kimura", "classical", "", "Kimura empirical distance", "any"),
+    "cosine_onehot": MatrixInfo("cosine_onehot", "cosine", "", "Cosine – one-hot positions", "any"),
+    "cosine_physico": MatrixInfo("cosine_physico", "cosine", "", "Cosine – physicochemical (7D)", "any"),
+    "cosine_blosum": MatrixInfo("cosine_blosum", "cosine", "", "Cosine – BLOSUM62 embedding", "any"),
+    "cosine_kmer": MatrixInfo("cosine_kmer", "cosine", "", "Cosine – k-mer frequencies", "any"),
 }
 
 PAM_METHODS = [k for k, v in MATRIX_REGISTRY.items() if v.family == "PAM"]
@@ -418,9 +566,8 @@ class SubstitutionMatrixCache:
 
     @classmethod
     def score(cls, name: str, aa1: str, aa2: str) -> float:
-        mat = cls.get(name)
         try:
-            return float(mat[aa1.upper()][aa2.upper()])
+            return float(cls.get(name)[aa1.upper()][aa2.upper()])
         except (KeyError, IndexError):
             return 0.0
 
@@ -457,15 +604,15 @@ def substitution_matrix_distance(
     if not pairs: return 1.0
     if metric == "normalized_score":
         obs = sum(SubstitutionMatrixCache.score(matrix_name, a, b) for a, b in pairs)
-        s1s = sum(SubstitutionMatrixCache.score(matrix_name, a, a) for a, b in pairs)
-        s2s = sum(SubstitutionMatrixCache.score(matrix_name, b, b) for a, b in pairs)
-        denom = (s1s + s2s) / 2.0
-        return max(0.0, 1.0 - obs / denom) if denom else 1.0
+        ss1 = sum(SubstitutionMatrixCache.score(matrix_name, a, a) for a, b in pairs)
+        ss2 = sum(SubstitutionMatrixCache.score(matrix_name, b, b) for a, b in pairs)
+        den = (ss1 + ss2) / 2.0
+        return max(0.0, 1.0 - obs / den) if den else 1.0
     elif metric == "log_odds":
-        scores = [SubstitutionMatrixCache.score(matrix_name, a, b) for a, b in pairs]
-        selfs = [SubstitutionMatrixCache.score(matrix_name, a, a) for a, b in pairs]
-        mx = max(selfs) if selfs else 1.0
-        return max(0.0, 1.0 - np.mean(scores) / mx) if mx else 1.0
+        sc = [SubstitutionMatrixCache.score(matrix_name, a, b) for a, b in pairs]
+        slf = [SubstitutionMatrixCache.score(matrix_name, a, a) for a, b in pairs]
+        mx = max(slf) if slf else 1.0
+        return max(0.0, 1.0 - np.mean(sc) / mx) if mx else 1.0
     elif metric == "percent_similarity":
         pos = sum(1 for a, b in pairs if SubstitutionMatrixCache.score(matrix_name, a, b) > 0)
         return 1.0 - pos / len(pairs)
@@ -487,8 +634,8 @@ def calculate_distance_matrix(
 
     if method in COSINE_METHODS:
         scheme = COSINE_SCHEME_MAP[method]
-        print(f"\n  Cosine distance | encoding: '{scheme}'"
-              + (f" | k={cosine_k}" if scheme == "kmer_freq" else ""))
+        print(f"\n  Cosine | encoding='{scheme}'"
+              + (f" k={cosine_k}" if scheme == "kmer_freq" else ""))
         D = CosineDistanceEngine(scheme=scheme, k=cosine_k).compute_matrix(alignment)
         up = D[np.triu_indices(n, k=1)]
         print(f"  ✓  min={up.min():.4f}  max={up.max():.4f}  mean={up.mean():.4f}")
@@ -497,7 +644,6 @@ def calculate_distance_matrix(
     total = n * (n - 1) // 2
     print(f"\n  Computing {total} pairs  [method={method}] …")
     D = np.zeros((n, n), dtype=float)
-
     for cnt, (i, j) in enumerate(combinations(range(n), 2), 1):
         if method == "hamming":
             d = hamming_distance(str(alignment[i].seq), str(alignment[j].seq))
@@ -509,7 +655,6 @@ def calculate_distance_matrix(
             key = MATRIX_REGISTRY[method].biopython_key
             d = substitution_matrix_distance(
                 str(alignment[i].seq), str(alignment[j].seq), key, sub_metric)
-
         D[i, j] = D[j, i] = np.nan if (np.isinf(d) or np.isnan(d)) else d
         if cnt % max(1, total // 10) == 0:
             print(f"    {cnt}/{total}  ({100 * cnt / total:.0f}%)")
@@ -519,7 +664,7 @@ def calculate_distance_matrix(
         fmax = finite.max()
         nan_n = int(np.isnan(D).sum()) // 2
         if nan_n:
-            print(f"  ⚠  {nan_n} saturated pairs → clamped to {fmax:.4f}")
+            print(f"  ⚠  {nan_n} saturated → clamped to {fmax:.4f}")
             D = np.where(np.isnan(D), fmax, D)
         up = D[np.triu_indices(n, k=1)]
         print(f"  ✓  min={up.min():.4f}  max={up.max():.4f}  mean={up.mean():.4f}")
@@ -551,21 +696,16 @@ def print_alignment_summary(
 ) -> Tuple[int, int]:
     n, L = len(aln), aln.get_alignment_length()
     print(f"\n{'─' * 70}")
-    print(f"  Sequences  : {n}")
-    print(f"  Aln length : {L} columns")
-    print(f"  {'Original ID':<35}  {'Display Label':<30}  Gaps%")
-    print(f"  {'─' * 35}  {'─' * 30}  {'─' * 5}")
+    print(f"  Sequences  : {n}   |   Alignment length : {L} columns")
+    print(f"  {'Original ID':<35}  {'Display Label':<28}  Gaps%")
+    print(f"  {'─' * 35}  {'─' * 28}  {'─' * 5}")
     for rec in aln:
         gp = str(rec.seq).count("-") / L * 100
         label = label_mgr.replace(rec.id)
-        orig = rec.id[:34]
-        disp = label[:29]
-        # Flag if label was actually replaced
         marker = " ◀" if label != rec.id else ""
-        print(f"  {orig:<35}  {disp:<30}  {gp:5.1f}%{marker}")
+        print(f"  {rec.id[:34]:<35}  {label[:27]:<28}  {gp:5.1f}%{marker}")
     print(f"{'─' * 70}\n")
-    if n < 2:
-        raise ValueError("Need ≥ 2 sequences.")
+    if n < 2: raise ValueError("Need ≥ 2 sequences.")
     return n, L
 
 
@@ -584,11 +724,11 @@ def pick_text_color(rgba) -> str:
 
 def _draw_cluster_boxes(ax, order, cluster_map):
     n = len(order)
-    reord_cl = [cluster_map[order[i]] for i in range(n)]
-    unique = sorted(set(reord_cl))
+    reord = [cluster_map[order[i]] for i in range(n)]
+    unique = sorted(set(reord))
     palette = plt.cm.get_cmap("Set2")(np.linspace(0, 1, max(len(unique), 1)))
     for ci, cl_id in enumerate(unique):
-        idxs = [i for i, c in enumerate(reord_cl) if c == cl_id]
+        idxs = [i for i, c in enumerate(reord) if c == cl_id]
         if not idxs: continue
         lo, hi = min(idxs), max(idxs)
         ax.add_patch(plt.Rectangle(
@@ -602,12 +742,13 @@ def _draw_cluster_boxes(ax, order, cluster_map):
 
 def plot_heatmap_with_dendrogram(
         dist_matrix: np.ndarray,
-        labels: List[str],  # display labels (already replaced)
-        original_ids: List[str],  # original sequence IDs
+        labels: List[str],
+        original_ids: List[str],
         method: str = "BLOSUM62",
         linkage_method: str = "average",
         colormap: Optional[str] = None,
-        output_path: Optional[str] = None,
+        exporter: Optional[FigureExporter] = None,
+        base_path: Optional[str] = None,
         title: Optional[str] = None,
         figsize: Optional[Tuple] = None,
         n_clusters: int = 0,
@@ -627,7 +768,7 @@ def plot_heatmap_with_dendrogram(
     order = leaves_list(Z)
     reord = dist_matrix[np.ix_(order, order)]
     reord_labels = [short[i] for i in order]
-    reord_originals = [original_ids[i] for i in order]
+    reord_origs = [original_ids[i] for i in order]
 
     thr = 0.3 * Z[:, 2].max()
     cl_ids = (fcluster(Z, t=n_clusters, criterion="maxclust")
@@ -651,14 +792,12 @@ def plot_heatmap_with_dendrogram(
 
     dend_thr = 0.65 * Z[:, 2].max()
 
-    # Top dendrogram
     dendrogram(Z, ax=ax_td, color_threshold=dend_thr,
                above_threshold_color="#888", orientation="top", no_labels=True)
     ax_td.set_xlim(0, n * 10);
     ax_td.axis("off");
     ax_td.set_facecolor("#fafafa")
 
-    # Left dendrogram
     dendrogram(Z, ax=ax_ld, color_threshold=dend_thr,
                above_threshold_color="#888", orientation="left", no_labels=True)
     ax_ld.set_ylim(0, n * 10);
@@ -666,7 +805,6 @@ def plot_heatmap_with_dendrogram(
     ax_ld.axis("off");
     ax_ld.set_facecolor("#fafafa")
 
-    # Heatmap
     cmap_obj = plt.cm.get_cmap(cmap)
     vmax = reord.max() or 1.0
     im = ax_hm.imshow(reord, aspect="auto", cmap=cmap_obj,
@@ -684,7 +822,6 @@ def plot_heatmap_with_dendrogram(
     ax_hm.tick_params(which="minor", length=0);
     ax_hm.tick_params(length=2, pad=2)
 
-    # Tooltips via cell annotation
     if n <= 25:
         cfs = max(4, min(8, 85 // n))
         for ii in range(n):
@@ -700,23 +837,24 @@ def plot_heatmap_with_dendrogram(
                                       fill=False, edgecolor="#555", linewidth=1.2))
     _draw_cluster_boxes(ax_hm, order, cluster_map)
 
-    # Colorbar
     cbar = plt.colorbar(im, cax=ax_cb)
     cbar.set_label("Distance", fontsize=10, labelpad=6)
     cbar.ax.tick_params(labelsize=8)
 
-    # Info box – shows method + whether labels were replaced
     info = MATRIX_REGISTRY.get(method)
-    labels_changed = any(l != o for l, o in zip(labels, original_ids))
-    lbl_note = "custom labels ✓" if labels_changed else "original IDs"
+    lbl_changed = any(l != o for l, o in zip(labels, original_ids))
+    lbl_note = "custom labels ✓" if lbl_changed else "original IDs"
+    # Include output format in info box
+    fmt_note = exporter.describe() if exporter else "PNG"
     txt = (f"Method  : {method}\n"
            f"Family  : {fam}\n"
            f"Linkage : {linkage_method}\n"
            f"n seqs  : {n}\n"
            f"Labels  : {lbl_note}\n"
+           f"Output  : {fmt_note}\n"
            + (f"Id range: {info.typical_identity}" if info else ""))
     ax_in.text(0.05, 0.95, txt, transform=ax_in.transAxes,
-               fontsize=8, va="top", fontfamily="monospace",
+               fontsize=7.5, va="top", fontfamily="monospace",
                bbox=dict(boxstyle="round", facecolor="#f0f4ff",
                          edgecolor=FAMILY_COLORS.get(fam, "#aaa"), alpha=0.9))
 
@@ -725,9 +863,8 @@ def plot_heatmap_with_dendrogram(
     fig.suptitle(ttl, fontsize=13, fontweight="bold", y=0.998)
     plt.tight_layout(rect=[0, 0, 1, 0.995])
 
-    if output_path:
-        fig.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="white")
-        print(f"  ✓  Heatmap → {output_path}")
+    if exporter and base_path:
+        exporter.save_and_report(fig, base_path, label="Heatmap", title=ttl)
 
     return fig, reord, list(order)
 
@@ -739,8 +876,9 @@ def plot_heatmap_with_dendrogram(
 def plot_cosine_encoding_comparison(
         alignment: MultipleSeqAlignment,
         labels: List[str],
-        output_path: Optional[str] = None,
-):
+        exporter: Optional[FigureExporter] = None,
+        base_path: Optional[str] = None,
+) -> plt.Figure:
     schemes = [
         ("one_hot", "One-Hot (20D)"),
         ("physicochemical", "Physicochemical (7D)"),
@@ -751,7 +889,6 @@ def plot_cosine_encoding_comparison(
     short = [shorten(lb, 18) for lb in labels]
     fig, axes = plt.subplots(2, 2, figsize=(14, 12), facecolor="white")
     axes = axes.flatten()
-
     for ax, (scheme, title) in zip(axes, schemes):
         D = CosineDistanceEngine(scheme=scheme, k=2).compute_matrix(alignment)
         im = ax.imshow(D, cmap="PuRd", vmin=0, vmax=1,
@@ -759,8 +896,7 @@ def plot_cosine_encoding_comparison(
         fs = max(5, min(9, 120 // n))
         ax.set_xticks(range(n));
         ax.set_yticks(range(n))
-        ax.set_xticklabels(short, rotation=45, ha="right",
-                           fontsize=fs, fontfamily="monospace")
+        ax.set_xticklabels(short, rotation=45, ha="right", fontsize=fs, fontfamily="monospace")
         ax.set_yticklabels(short, fontsize=fs, fontfamily="monospace")
         ax.set_title(title, fontsize=11, fontweight="bold", color="#9B59B6")
         plt.colorbar(im, ax=ax, shrink=0.85, pad=0.02)
@@ -770,26 +906,25 @@ def plot_cosine_encoding_comparison(
                     rgba = plt.cm.PuRd(D[ii, jj])
                     ax.text(jj, ii, f"{D[ii, jj]:.2f}", ha="center", va="center",
                             fontsize=max(4, 55 // n), color=pick_text_color(rgba))
-
-    fig.suptitle("Cosine Distance: Encoding Scheme Comparison",
-                 fontsize=14, fontweight="bold", y=1.01)
+    ttl = "Cosine Distance: Encoding Scheme Comparison"
+    fig.suptitle(ttl, fontsize=14, fontweight="bold", y=1.01)
     plt.tight_layout()
-    if output_path:
-        fig.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="white")
-        print(f"  ✓  Cosine scheme comparison → {output_path}")
+    if exporter and base_path:
+        exporter.save_and_report(fig, base_path, label="Cosine schemes", title=ttl)
     return fig
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PLOT 3 – MDS SEQUENCE MAP
+#  PLOT 3 – MDS MAP
 # ══════════════════════════════════════════════════════════════════════════════
 
 def plot_mds_sequence_map(
         all_matrices: Dict[str, np.ndarray],
         labels: List[str],
         methods: List[str],
-        output_path: Optional[str] = None,
-):
+        exporter: Optional[FigureExporter] = None,
+        base_path: Optional[str] = None,
+) -> plt.Figure:
     try:
         from sklearn.manifold import MDS
         def mds2d(D):
@@ -797,21 +932,18 @@ def plot_mds_sequence_map(
                        random_state=42, n_init=4).fit_transform(D)
     except ImportError:
         def mds2d(D):
-            n = D.shape[0]
+            n = D.shape[0];
             H = np.eye(n) - np.ones((n, n)) / n
             B = -0.5 * H @ (D ** 2) @ H
             vals, vecs = np.linalg.eigh(B)
             idx = np.argsort(-vals)
-            vals, vecs = vals[idx], vecs[:, idx]
-            return vecs[:, :2] * np.sqrt(np.maximum(vals[:2], 0))
+            return vecs[:, idx][:, :2] * np.sqrt(np.maximum(vals[idx][:2], 0))
 
-    n_m = len(methods)
+    n_m = len(methods);
     short = [shorten(lb, 14) for lb in labels]
-    fig, axes = plt.subplots(1, n_m, figsize=(5.5 * n_m, 5),
-                             facecolor="white", squeeze=False)
-
+    fig, axes = plt.subplots(1, n_m, figsize=(5.5 * n_m, 5), facecolor="white", squeeze=False)
     for ax, method in zip(axes[0], methods):
-        fam = family_of(method)
+        fam = family_of(method);
         D = all_matrices[method]
         coords = mds2d(np.clip(D, 0, None))
         Z = linkage(squareform(np.clip(D, 0, None)), method="average")
@@ -828,12 +960,11 @@ def plot_mds_sequence_map(
         ax.set_ylabel("MDS-2", fontsize=9)
         ax.grid(alpha=0.25);
         ax.set_facecolor("#fafafa")
-
-    fig.suptitle("2-D MDS Sequence Map", fontsize=13, fontweight="bold")
+    ttl = "2-D MDS Sequence Map"
+    fig.suptitle(ttl, fontsize=13, fontweight="bold")
     plt.tight_layout()
-    if output_path:
-        fig.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="white")
-        print(f"  ✓  MDS map → {output_path}")
+    if exporter and base_path:
+        exporter.save_and_report(fig, base_path, label="MDS map", title=ttl)
     return fig
 
 
@@ -844,19 +975,18 @@ def plot_mds_sequence_map(
 def plot_multi_method_comparison(
         matrices: Dict[str, np.ndarray],
         labels: List[str],
-        output_path: Optional[str] = None,
-):
-    methods = list(matrices.keys())
+        exporter: Optional[FigureExporter] = None,
+        base_path: Optional[str] = None,
+) -> plt.Figure:
+    methods = list(matrices.keys());
     n_m = len(methods)
-    n = len(labels)
+    n = len(labels);
     short = [shorten(lb, 16) for lb in labels]
     cell = max(3.0, 0.35 * n)
-    fig, axes = plt.subplots(1, n_m, figsize=(cell * n_m + 2, cell + 2.5),
-                             facecolor="#f8f8f8")
+    fig, axes = plt.subplots(1, n_m, figsize=(cell * n_m + 2, cell + 2.5), facecolor="#f8f8f8")
     if n_m == 1: axes = [axes]
-
     for ax, method in zip(axes, methods):
-        mat = matrices[method]
+        mat = matrices[method];
         fam = family_of(method)
         cmap = COLORMAPS.get(fam, "viridis")
         im = ax.imshow(mat, cmap=cmap, vmin=0, vmax=mat.max(),
@@ -877,18 +1007,16 @@ def plot_multi_method_comparison(
                     ax.text(jj, ii, f"{mat[ii, jj]:.2f}", ha="center", va="center",
                             fontsize=max(3, 55 // n), color=pick_text_color(rgba))
         plt.colorbar(im, ax=ax, shrink=0.8, pad=0.03)
-
     handles = [mpatches.Patch(color=c, label=fam)
                for fam, c in FAMILY_COLORS.items()
                if any(family_of(m) == fam for m in methods)]
     fig.legend(handles=handles, loc="lower center", ncol=len(handles),
                fontsize=8, framealpha=0.7, bbox_to_anchor=(0.5, -0.01))
-    fig.suptitle("Multi-Method Distance Comparison", fontsize=13,
-                 fontweight="bold", y=1.01)
+    ttl = "Multi-Method Distance Comparison"
+    fig.suptitle(ttl, fontsize=13, fontweight="bold", y=1.01)
     plt.tight_layout()
-    if output_path:
-        fig.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="#f8f8f8")
-        print(f"  ✓  Comparison grid → {output_path}")
+    if exporter and base_path:
+        exporter.save_and_report(fig, base_path, label="Method comparison", title=ttl)
     return fig
 
 
@@ -899,37 +1027,33 @@ def plot_multi_method_comparison(
 def plot_distance_distribution(
         matrices: Dict[str, np.ndarray],
         labels: List[str],
-        output_path: Optional[str] = None,
-):
-    n = len(labels)
+        exporter: Optional[FigureExporter] = None,
+        base_path: Optional[str] = None,
+) -> plt.Figure:
+    n = len(labels);
     methods = list(matrices.keys())
     short = [shorten(lb, 16) for lb in labels]
     fig, axes = plt.subplots(1, 2, figsize=(14, 5), facecolor="white")
-
     ax = axes[0]
     for method, mat in matrices.items():
         fam = family_of(method);
         col = FAMILY_COLORS.get(fam, "steelblue")
         up = mat[np.triu_indices(n, k=1)]
         ax.hist(up, bins=min(30, max(5, len(up) // 3)), alpha=0.45,
-                color=col, edgecolor="white",
-                label=f"{method} (μ={up.mean():.3f})")
+                color=col, edgecolor="white", label=f"{method} (μ={up.mean():.3f})")
         ax.axvline(up.mean(), color=col, linestyle="--", linewidth=1.5)
     ax.set_xlabel("Distance", fontsize=11);
     ax.set_ylabel("Count", fontsize=11)
     ax.set_title("Pairwise Distance Distribution", fontsize=12, fontweight="bold")
     ax.legend(fontsize=7, framealpha=0.85);
     ax.grid(alpha=0.3)
-
-    ax2 = axes[1]
+    ax2 = axes[1];
     x = np.arange(n);
     bw = 0.8 / max(len(methods), 1)
     for mi, (method, mat) in enumerate(matrices.items()):
         fam = family_of(method);
         col = FAMILY_COLORS.get(fam, "steelblue")
-        means = np.array([
-            np.mean(np.concatenate([mat[i, :i], mat[i, i + 1:]])) for i in range(n)
-        ])
+        means = np.array([np.mean(np.concatenate([mat[i, :i], mat[i, i + 1:]])) for i in range(n)])
         off = (mi - len(methods) / 2 + 0.5) * bw
         ax2.bar(x + off, means, width=bw * 0.88, color=col, alpha=0.72, label=method)
     fs = max(6, min(10, 110 // n))
@@ -939,11 +1063,10 @@ def plot_distance_distribution(
     ax2.set_title("Per-Sequence Mean Distance", fontsize=12, fontweight="bold")
     ax2.legend(fontsize=7, framealpha=0.85);
     ax2.grid(alpha=0.3, axis="y")
-
     plt.tight_layout()
-    if output_path:
-        fig.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="white")
-        print(f"  ✓  Distribution → {output_path}")
+    ttl = "Distance Distributions"
+    if exporter and base_path:
+        exporter.save_and_report(fig, base_path, label="Distributions", title=ttl)
     return fig
 
 
@@ -953,31 +1076,28 @@ def plot_distance_distribution(
 
 def plot_method_correlation(
         matrices: Dict[str, np.ndarray],
-        output_path: Optional[str] = None,
-):
-    methods = list(matrices.keys())
+        exporter: Optional[FigureExporter] = None,
+        base_path: Optional[str] = None,
+) -> Optional[plt.Figure]:
+    methods = list(matrices.keys());
     n_m = len(methods)
-    if n_m < 2:
-        print("  ⚠  Need ≥ 2 methods for correlation plot.");
-        return None
+    if n_m < 2: print("  ⚠  Need ≥ 2 methods for correlation."); return None
     n_seq = list(matrices.values())[0].shape[0]
     idx = np.triu_indices(n_seq, k=1)
     vecs = {m: matrices[m][idx] for m in methods}
     fig, axes = plt.subplots(n_m, n_m, figsize=(3.5 * n_m, 3.5 * n_m), facecolor="white")
-
     for i, mi in enumerate(methods):
         for j, mj in enumerate(methods):
             ax = axes[i][j];
             di, dj = vecs[mi], vecs[mj]
-            fi, fj = family_of(mi), family_of(mj)
+            fi = family_of(mi)
             if i == j:
                 ax.hist(di, bins=20, color=FAMILY_COLORS.get(fi, "steelblue"),
                         edgecolor="white", alpha=0.8)
                 ax.set_title(mi, fontsize=8, fontweight="bold",
                              color=FAMILY_COLORS.get(fi, "#333"))
             elif i < j:
-                ax.scatter(dj, di, s=7, alpha=0.45,
-                           color=FAMILY_COLORS.get(fi, "steelblue"))
+                ax.scatter(dj, di, s=7, alpha=0.45, color=FAMILY_COLORS.get(fi, "steelblue"))
                 r, _ = pearsonr(di, dj);
                 rs, _ = spearmanr(di, dj)
                 ax.set_title(f"r={r:.3f}  ρ={rs:.3f}", fontsize=7)
@@ -986,16 +1106,113 @@ def plot_method_correlation(
                 ax.axhline(0, color="red", linewidth=1, linestyle="--")
                 ax.scatter(dj, res, s=5, alpha=0.35, color=FAMILY_COLORS.get(fi, "gray"))
                 ax.set_title(f"{mi}−{mj}", fontsize=7)
-            if j == 0:     ax.set_ylabel(mi, fontsize=7)
+            if j == 0: ax.set_ylabel(mi, fontsize=7)
             if i == n_m - 1: ax.set_xlabel(mj, fontsize=7)
             ax.tick_params(labelsize=5)
-
-    fig.suptitle("Method Correlation Matrix", fontsize=10, fontweight="bold")
+    ttl = "Method Correlation Matrix"
+    fig.suptitle(ttl, fontsize=10, fontweight="bold")
     plt.tight_layout()
-    if output_path:
-        fig.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="white")
-        print(f"  ✓  Correlation → {output_path}")
+    if exporter and base_path:
+        exporter.save_and_report(fig, base_path, label="Correlation matrix", title=ttl)
     return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MULTI-PAGE PDF REPORT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_multipage_pdf_report(
+        all_figures: List[Tuple[plt.Figure, str]],  # [(fig, title), …]
+        pdf_path: str,
+        pipeline_meta: Dict,
+) -> None:
+    """
+    Combine every figure produced by the pipeline into a single, structured
+    multi-page PDF report with a cover page.
+
+    Parameters
+    ──────────
+    all_figures   : list of (figure, page_title) pairs in order.
+    pdf_path      : destination path for the combined PDF.
+    pipeline_meta : dict with keys: input_file, methods, linkage, n_seqs,
+                    label_tsv, output_prefix, timestamp.
+    """
+    Path(pdf_path).parent.mkdir(parents=True, exist_ok=True)
+
+    metadata = {
+        "Title": "Protein Distance Analysis Report",
+        "Author": "protein_distances pipeline",
+        "Subject": f"Analysis of {pipeline_meta.get('input_file', 'unknown')}",
+        "CreationDate": datetime.datetime.now(),
+    }
+
+    with PdfPages(pdf_path, metadata=metadata) as pdf:
+
+        # ── Cover page ────────────────────────────────────────────────────────
+        cover = plt.figure(figsize=(11, 8.5), facecolor="white")
+        ax = cover.add_subplot(111);
+        ax.axis("off")
+
+        # Title block
+        ax.text(0.5, 0.88, "Protein Pairwise Distance Analysis",
+                ha="center", va="center", fontsize=22, fontweight="bold",
+                transform=ax.transAxes, color="#1a1a2e")
+        ax.text(0.5, 0.80, "Automated Report",
+                ha="center", va="center", fontsize=14,
+                transform=ax.transAxes, color="#4a4a6a")
+
+        # Horizontal rule
+        ax.axhline(0.76, xmin=0.05, xmax=0.95, color="#4A90D9", linewidth=2)
+
+        # Metadata table
+        ts = pipeline_meta.get("timestamp", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        rows = [
+            ("Input file", pipeline_meta.get("input_file", "–")),
+            ("Label TSV", pipeline_meta.get("label_tsv", "(none)")),
+            ("Sequences", str(pipeline_meta.get("n_seqs", "–"))),
+            ("Methods", ", ".join(pipeline_meta.get("methods", []))),
+            ("Linkage", pipeline_meta.get("linkage", "–")),
+            ("Sub-metric", pipeline_meta.get("sub_metric", "–")),
+            ("Output prefix", pipeline_meta.get("output_prefix", "–")),
+            ("Figures", str(len(all_figures))),
+            ("Generated", ts),
+        ]
+        y = 0.70
+        for key, val in rows:
+            ax.text(0.10, y, f"{key}:", ha="left", va="center",
+                    fontsize=10, fontweight="bold", transform=ax.transAxes, color="#333")
+            ax.text(0.38, y, val, ha="left", va="center",
+                    fontsize=10, transform=ax.transAxes, color="#555",
+                    fontfamily="monospace")
+            y -= 0.062
+
+        # Figure index
+        ax.axhline(y - 0.01, xmin=0.05, xmax=0.95, color="#ccc", linewidth=1)
+        y -= 0.05
+        ax.text(0.10, y, "Contents:", ha="left", va="center",
+                fontsize=10, fontweight="bold", transform=ax.transAxes, color="#333")
+        y -= 0.05
+        for page_n, (_, pg_title) in enumerate(all_figures, start=2):
+            ax.text(0.12, y, f"  p.{page_n:02d}   {pg_title}",
+                    ha="left", va="center", fontsize=9,
+                    transform=ax.transAxes, color="#444", fontfamily="monospace")
+            y -= 0.045
+            if y < 0.04: break  # avoid running off page
+
+        # Footer
+        ax.text(0.5, 0.02, f"Generated by protein_distances pipeline  ·  {ts}",
+                ha="center", va="bottom", fontsize=8,
+                transform=ax.transAxes, color="#aaa")
+
+        pdf.savefig(cover, dpi=150, bbox_inches="tight", facecolor="white")
+        plt.close(cover)
+
+        # ── Content pages ─────────────────────────────────────────────────────
+        for fig, pg_title in all_figures:
+            pdf.savefig(fig, dpi=150, bbox_inches="tight", facecolor="white")
+
+    n_pages = len(all_figures) + 1  # +1 for cover
+    print(f"  ✓  Multi-page PDF report ({n_pages} pages) → {pdf_path}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1007,37 +1224,28 @@ def save_distance_matrix(
         display_labels: List[str],
         original_ids: List[str],
         base: str,
-):
-    """
-    Save in PHYLIP (original IDs, 10-char limit) and CSV (display labels).
-    Also write a TSV mapping file and a JSON summary.
-    """
+) -> None:
     n = len(display_labels)
-
-    # PHYLIP uses original IDs (10-char limit required by format)
     with open(base + ".phy", "w") as f:
         f.write(f"   {n}\n")
         for i, orig in enumerate(original_ids):
             f.write(f"{orig[:10].ljust(10)} "
                     + " ".join(f"{D[i, j]:.6f}" for j in range(n)) + "\n")
-    print(f"  ✓  PHYLIP (original IDs) → {base}.phy")
+    print(f"  ✓  PHYLIP          → {base}.phy")
 
-    # CSV uses display labels
     with open(base + ".csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([""] + display_labels)
         for i, lb in enumerate(display_labels):
             w.writerow([lb] + [f"{D[i, j]:.6f}" for j in range(n)])
-    print(f"  ✓  CSV (display labels)  → {base}.csv")
+    print(f"  ✓  CSV             → {base}.csv")
 
-    # TSV mapping: original_id → display_label
     with open(base + "_id_map.tsv", "w") as f:
         f.write("original_id\tdisplay_label\n")
-        for orig, disp in zip(original_ids, display_labels):
-            f.write(f"{orig}\t{disp}\n")
-    print(f"  ✓  ID map TSV            → {base}_id_map.tsv")
+        for o, d in zip(original_ids, display_labels):
+            f.write(f"{o}\t{d}\n")
+    print(f"  ✓  ID map TSV      → {base}_id_map.tsv")
 
-    # JSON summary
     up = D[np.triu_indices(n, k=1)]
     with open(base + "_summary.json", "w") as f:
         json.dump({
@@ -1046,12 +1254,10 @@ def save_distance_matrix(
             "max_distance": float(up.max()),
             "mean_distance": float(up.mean()),
             "std_distance": float(up.std()),
-            "sequences": [
-                {"original_id": o, "display_label": d}
-                for o, d in zip(original_ids, display_labels)
-            ],
+            "sequences": [{"original_id": o, "display_label": d}
+                          for o, d in zip(original_ids, display_labels)],
         }, f, indent=2)
-    print(f"  ✓  JSON summary          → {base}_summary.json")
+    print(f"  ✓  JSON summary    → {base}_summary.json")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1064,17 +1270,11 @@ def generate_demo_alignment(
         n_clusters: int = 3,
         seed: int = 42,
 ) -> Tuple[str, str]:
-    """
-    Returns (fasta_path, tsv_path).
-    Generates a synthetic MSA and a matching TSV label file.
-    """
     np.random.seed(seed)
     AA = list("ACDEFGHIKLMNPQRSTVWY")
     per = [n_seqs // n_clusters] * n_clusters
     per[-1] += n_seqs - sum(per)
-    cl_names = [chr(65 + c) for c in range(n_clusters)]  # A, B, C …
-
-    # Fictional organism names for demo TSV
+    cl_names = [chr(65 + c) for c in range(n_clusters)]
     organisms = [
         "Homo sapiens", "Mus musculus", "Rattus norvegicus", "Gallus gallus",
         "Danio rerio", "Xenopus laevis", "Drosophila melanogaster",
@@ -1082,43 +1282,32 @@ def generate_demo_alignment(
         "Escherichia coli", "Bacillus subtilis", "Streptomyces coelicolor",
         "Methanocaldococcus jannaschii", "Sulfolobus solfataricus",
     ]
-
-    records = []
-    tsv_rows = []
+    records = [];
+    tsv_rows = [];
     org_idx = 0
-
     for c in range(n_clusters):
         ancestor = "".join(np.random.choice(AA, aln_len))
         for s in range(per[c]):
             mut = list(ancestor)
-            n_mut = int(aln_len * np.random.uniform(0.05, 0.15))
-            for pos in np.random.choice(aln_len, n_mut, replace=False):
+            for pos in np.random.choice(aln_len, int(aln_len * np.random.uniform(0.05, 0.15)), replace=False):
                 mut[pos] = np.random.choice(AA)
-            n_gap = int(aln_len * np.random.uniform(0.02, 0.05))
-            for pos in np.random.choice(aln_len, n_gap, replace=False):
+            for pos in np.random.choice(aln_len, int(aln_len * np.random.uniform(0.02, 0.05)), replace=False):
                 mut[pos] = "-"
             seq_id = f"Cluster{cl_names[c]}_{s + 1:02d}"
             org = organisms[org_idx % len(organisms)]
-            disp_lb = f"{org} | Cluster-{cl_names[c]}"
             records.append(SeqRecord(Seq("".join(mut)), id=seq_id, description=""))
-            tsv_rows.append((seq_id, disp_lb))
+            tsv_rows.append((seq_id, f"{org} | Cluster-{cl_names[c]}"))
             org_idx += 1
 
     fasta_path = "demo_protein_alignment.fasta"
     tsv_path = "demo_labels.tsv"
-
     with open(fasta_path, "w") as f:
-        for rec in records:
-            f.write(f">{rec.id}\n{rec.seq}\n")
-
+        for rec in records: f.write(f">{rec.id}\n{rec.seq}\n")
     with open(tsv_path, "w") as f:
         f.write("original_id\tdisplay_label\n")
-        for orig, disp in tsv_rows:
-            f.write(f"{orig}\t{disp}\n")
-
-    print(f"  ✓  Demo MSA   ({n_seqs} seqs, {aln_len} cols, "
-          f"{n_clusters} clusters) → {fasta_path}")
-    print(f"  ✓  Demo labels ({len(tsv_rows)} mappings)        → {tsv_path}")
+        for o, d in tsv_rows: f.write(f"{o}\t{d}\n")
+    print(f"  ✓  Demo MSA    ({n_seqs} seqs, {aln_len} cols) → {fasta_path}")
+    print(f"  ✓  Demo labels ({len(tsv_rows)} mappings)       → {tsv_path}")
     return fasta_path, tsv_path
 
 
@@ -1135,36 +1324,47 @@ def run_pipeline(
         cosine_k: int = 2,
         fmt: Optional[str] = None,
         output_prefix: str = "protein_dist",
+        output_format: str = "png",  # png | pdf | svg | all
+        dpi: int = 150,
+        pdf_report: bool = True,  # build combined PDF report?
         show_plots: bool = True,
         save_matrices: bool = True,
         compare_methods: bool = True,
         run_mds: bool = True,
 ) -> Tuple[Dict[str, np.ndarray], LabelManager]:
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     print(f"\n{'═' * 65}")
     print(f"  Protein Distance Analysis Pipeline")
     print(f"{'═' * 65}")
-    print(f"  Input      : {input_file}")
-    print(f"  Label TSV  : {label_tsv or '(none – using original IDs)'}")
-    print(f"  Methods    : {', '.join(methods)}")
-    print(f"  Linkage    : {linkage_method}")
-    print(f"  Sub-metric : {sub_metric}")
-    print(f"  k (cosine) : {cosine_k}")
+    print(f"  Input         : {input_file}")
+    print(f"  Label TSV     : {label_tsv or '(none)'}")
+    print(f"  Methods       : {', '.join(methods)}")
+    print(f"  Linkage       : {linkage_method}")
+    print(f"  Sub-metric    : {sub_metric}")
+    print(f"  k (cosine)    : {cosine_k}")
+    print(f"  Output format : {output_format.upper()}")
+    print(f"  DPI           : {dpi}")
+    print(f"  PDF report    : {'yes' if pdf_report else 'no'}")
+
+    # Exporter
+    exporter = FigureExporter(fmt=output_format, dpi=dpi)
+    print(f"  {exporter.describe()}")
 
     # ── 1. Labels ─────────────────────────────────────────────────────────────
     print(f"\n[1/7]  Loading labels …")
     label_mgr = LabelManager(label_tsv)
     print(label_mgr.summary())
 
-    # ── 2. Parse alignment ────────────────────────────────────────────────────
+    # ── 2. Parse ──────────────────────────────────────────────────────────────
     print(f"\n[2/7]  Parsing alignment …")
     alignment = parse_alignment(input_file, fmt=fmt)
     label_mgr.validate_against_alignment(alignment)
     n_seqs, _ = print_alignment_summary(alignment, label_mgr)
-
     original_ids = [rec.id for rec in alignment]
     display_labels = label_mgr.replace_all(original_ids)
 
-    # ── 3. Compute distances ──────────────────────────────────────────────────
+    # ── 3. Compute ─────────────────────────────────────────────────────────────
     print(f"\n[3/7]  Computing distance matrices …")
     all_matrices: Dict[str, np.ndarray] = {}
     for method in methods:
@@ -1174,66 +1374,89 @@ def run_pipeline(
             alignment, method, sub_metric=sub_metric, cosine_k=cosine_k,
         )
 
-    # ── 4. Save matrices ──────────────────────────────────────────────────────
+    # ── 4. Save matrices ───────────────────────────────────────────────────────
     if save_matrices:
         print(f"\n[4/7]  Saving matrices …")
         for method, D in all_matrices.items():
-            save_distance_matrix(
-                D,
-                display_labels=display_labels,
-                original_ids=original_ids,
-                base=f"{output_prefix}_{method}",
-            )
+            save_distance_matrix(D, display_labels, original_ids,
+                                 f"{output_prefix}_{method}")
     else:
         print(f"\n[4/7]  Skipping matrix save.")
 
-    # ── 5. Individual heatmaps ────────────────────────────────────────────────
+    # ── 5-7. Figures ───────────────────────────────────────────────────────────
+    # Collect all (figure, title) pairs for the PDF report
+    all_figures: List[Tuple[plt.Figure, str]] = []
+
     print(f"\n[5/7]  Heatmaps …")
     for method, D in all_matrices.items():
-        plot_heatmap_with_dendrogram(
-            D,
-            labels=display_labels,
-            original_ids=original_ids,
-            method=method,
-            linkage_method=linkage_method,
-            output_path=f"{output_prefix}_{method}_heatmap.png",
+        ttl = f"Heatmap – {method}"
+        base = f"{output_prefix}_{method}_heatmap"
+        fig, _, _ = plot_heatmap_with_dendrogram(
+            D, display_labels, original_ids,
+            method=method, linkage_method=linkage_method,
+            exporter=exporter, base_path=base, title=ttl,
         )
+        all_figures.append((fig, ttl))
 
-    # ── 6. Comparison plots ───────────────────────────────────────────────────
     print(f"\n[6/7]  Distribution & comparison plots …")
-    plot_distance_distribution(
+    fig_dist = plot_distance_distribution(
         all_matrices, display_labels,
-        output_path=f"{output_prefix}_distributions.png",
+        exporter=exporter, base_path=f"{output_prefix}_distributions",
     )
-    if compare_methods and len(methods) > 1:
-        plot_multi_method_comparison(
-            all_matrices, display_labels,
-            output_path=f"{output_prefix}_method_comparison.png",
-        )
-        plot_method_correlation(
-            all_matrices,
-            output_path=f"{output_prefix}_method_correlation.png",
-        )
+    all_figures.append((fig_dist, "Distance Distributions"))
 
-    # ── 7. Cosine / MDS extras ────────────────────────────────────────────────
+    if compare_methods and len(methods) > 1:
+        fig_cmp = plot_multi_method_comparison(
+            all_matrices, display_labels,
+            exporter=exporter, base_path=f"{output_prefix}_method_comparison",
+        )
+        all_figures.append((fig_cmp, "Multi-Method Comparison"))
+
+        fig_cor = plot_method_correlation(
+            all_matrices,
+            exporter=exporter, base_path=f"{output_prefix}_method_correlation",
+        )
+        if fig_cor: all_figures.append((fig_cor, "Method Correlation"))
+
     print(f"\n[7/7]  Extra visualisations …")
     if any(m in COSINE_METHODS for m in methods):
-        plot_cosine_encoding_comparison(
+        fig_cos = plot_cosine_encoding_comparison(
             alignment, display_labels,
-            output_path=f"{output_prefix}_cosine_schemes.png",
+            exporter=exporter, base_path=f"{output_prefix}_cosine_schemes",
         )
+        all_figures.append((fig_cos, "Cosine Encoding Comparison"))
+
     if run_mds and len(methods) >= 1:
-        plot_mds_sequence_map(
+        fig_mds = plot_mds_sequence_map(
             all_matrices, display_labels,
             methods=methods[:min(4, len(methods))],
-            output_path=f"{output_prefix}_mds_map.png",
+            exporter=exporter, base_path=f"{output_prefix}_mds_map",
+        )
+        all_figures.append((fig_mds, "2-D MDS Sequence Map"))
+
+    # ── Combined PDF report ────────────────────────────────────────────────────
+    if pdf_report:
+        meta = dict(
+            input_file=input_file,
+            label_tsv=label_tsv or "(none)",
+            methods=methods,
+            linkage=linkage_method,
+            sub_metric=sub_metric,
+            n_seqs=n_seqs,
+            output_prefix=output_prefix,
+            timestamp=timestamp,
+        )
+        build_multipage_pdf_report(
+            all_figures,
+            pdf_path=f"{output_prefix}_REPORT.pdf",
+            pipeline_meta=meta,
         )
 
     if show_plots:
         plt.show()
 
     print(f"\n{'═' * 65}")
-    print(f"  ✅  Done!")
+    print(f"     Done!   Timestamp: {timestamp}")
     print(f"{'═' * 65}\n")
     return all_matrices, label_mgr
 
@@ -1245,21 +1468,28 @@ def run_pipeline(
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="protein_distances",
-        description="Protein pairwise distances with optional TSV label replacement",
+        description="Protein pairwise distances – PAM, BLOSUM, Classical, Cosine | PDF/PNG/SVG output",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
-TSV label file format (2-column, tab-separated)
-─────────────────────────────────────────────────
-  # comment lines are ignored
-  original_id    display_label
-  SeqID_001      Homo sapiens hemoglobin alpha
-  SeqID_002      Mus musculus hemoglobin alpha
-  SeqID_003      Danio rerio hemoglobin alpha
+Output formats  (--output-format)
+──────────────────────────────────
+  png   – raster PNG  (default, 150 DPI)
+  pdf   – vector PDF  (publication-quality, embedded metadata)
+  svg   – vector SVG  (editable in Inkscape / Illustrator)
+  all   – PNG + PDF + SVG simultaneously
 
-  Rules:
-  • Header row (if first token is id/seq_id/original/name/label) is skipped.
-  • Sequence IDs not in the TSV keep their original ID.
-  • Duplicate IDs → last entry wins.
+PDF notes
+─────────
+  • Each figure is also saved as an individual PDF (when --output-format pdf/all).
+  • A combined multi-page PDF report (cover page + all figures) is always
+    written as  <prefix>_REPORT.pdf  unless --no-pdf-report is passed.
+  • PDF metadata (title, author, date) is embedded automatically.
+
+TSV label file  (--labels)
+───────────────────────────
+  # comment
+  original_id<TAB>display_label
+  SeqID_001<TAB>Homo sapiens hemoglobin alpha
 
 Method families
 ───────────────
@@ -1270,24 +1500,24 @@ Method families
 
 Examples
 ────────
-  # Demo (generates alignment + TSV automatically)
-  ppwd_vis.py --demo
+  # Demo (auto-generates MSA + TSV + PDF report)
+  ppwd_vis.py --demo --output-format pdf
 
-  # Custom alignment with label file
-  ppwd_vis.py -i aln.fasta --labels my_labels.tsv -m BLOSUM62 kimura
-
-  # All cosine methods + custom labels
-  ppwd_vis.py -i aln.fasta --labels labels.tsv --all-cosine
-
-  # Full run
+  # PDF output with custom labels
   ppwd_vis.py -i aln.fasta --labels labels.tsv \\
-      -m PAM120 BLOSUM62 cosine_physico kimura \\
-      -l ward --sub-metric normalized_score
+      -m BLOSUM62 kimura --output-format pdf
+
+  # All formats simultaneously
+  ppwd_vis.py -i aln.fasta -m PAM120 cosine_physico \\
+      --output-format all --dpi 300
+
+  # Single SVG per figure, no combined report
+  ppwd_vis.py -i aln.fasta -m BLOSUM62 \\
+      --output-format svg --no-pdf-report
         """
     )
     p.add_argument("-i", "--input", type=str, help="MSA file path")
-    p.add_argument("--labels", type=str, default=None,
-                   metavar="TSV",
+    p.add_argument("--labels", type=str, default=None, metavar="TSV",
                    help="Optional 2-column TSV: original_id → display_label")
     p.add_argument("-m", "--methods", type=str, nargs="+",
                    default=["BLOSUM62"], metavar="METHOD")
@@ -1295,37 +1525,32 @@ Examples
                    choices=["single", "complete", "average", "ward", "weighted"])
     p.add_argument("--sub-metric", type=str, default="normalized_score",
                    choices=["normalized_score", "log_odds", "percent_similarity"])
-    p.add_argument("--cosine-k", type=int, default=2,
-                   help="k for k-mer cosine encoding (default 2)")
+    p.add_argument("--cosine-k", type=int, default=2)
     p.add_argument("-f", "--format", type=str, default=None,
                    help="Alignment format: fasta|clustal|phylip|stockholm|nexus")
     p.add_argument("-o", "--output", type=str, default="protein_distances",
                    help="Output file prefix (default: protein_distances)")
-    p.add_argument("--demo", action="store_true",
-                   help="Run with auto-generated demo alignment + label TSV")
-    p.add_argument("--all-pam", action="store_true",
-                   help="Run all PAM methods")
-    p.add_argument("--all-blosum", action="store_true",
-                   help="Run all BLOSUM methods")
-    p.add_argument("--all-cosine", action="store_true",
-                   help="Run all cosine methods")
-    p.add_argument("--no-show", action="store_true",
-                   help="Do not display plots interactively")
-    p.add_argument("--no-save-matrix", action="store_true",
-                   help="Skip saving distance matrix files")
-    p.add_argument("--no-compare", action="store_true",
-                   help="Skip multi-method comparison plots")
-    p.add_argument("--no-mds", action="store_true",
-                   help="Skip MDS map")
-    p.add_argument("--list-methods", action="store_true",
-                   help="List all available methods and exit")
-    p.add_argument("--validate-tsv", type=str, default=None,
-                   metavar="TSV",
-                   help="Validate a TSV label file against an alignment and exit")
+    p.add_argument("--output-format", type=str, default="png",
+                   choices=SUPPORTED_FORMATS,
+                   help="Figure output format: png | pdf | svg | all  (default: png)")
+    p.add_argument("--dpi", type=int, default=150,
+                   help="Resolution for PNG output (default: 150)")
+    p.add_argument("--no-pdf-report", action="store_true",
+                   help="Skip the combined multi-page PDF report")
+    p.add_argument("--demo", action="store_true")
+    p.add_argument("--all-pam", action="store_true")
+    p.add_argument("--all-blosum", action="store_true")
+    p.add_argument("--all-cosine", action="store_true")
+    p.add_argument("--no-show", action="store_true")
+    p.add_argument("--no-save-matrix", action="store_true")
+    p.add_argument("--no-compare", action="store_true")
+    p.add_argument("--no-mds", action="store_true")
+    p.add_argument("--list-methods", action="store_true")
+    p.add_argument("--validate-tsv", type=str, default=None, metavar="TSV")
     return p
 
 
-def list_methods():
+def list_methods() -> None:
     print(f"\n{'─' * 72}")
     print(f"  {'Method':<20}  {'Family':<10}  Description")
     print(f"{'─' * 72}")
@@ -1341,7 +1566,6 @@ def list_methods():
 if __name__ == "__main__":
     args = build_parser().parse_args()
 
-    # ── Special actions ───────────────────────────────────────────────────────
     if args.list_methods:
         list_methods();
         sys.exit(0)
@@ -1356,7 +1580,6 @@ if __name__ == "__main__":
         print(mgr.summary());
         sys.exit(0)
 
-    # ── Collect methods ───────────────────────────────────────────────────────
     methods = list(args.methods)
     if args.all_pam:
         methods = PAM_METHODS + [m for m in methods if m not in PAM_METHODS]
@@ -1367,24 +1590,21 @@ if __name__ == "__main__":
 
     for m in methods:
         if m not in MATRIX_REGISTRY:
-            print(f"  ✗  Unknown method '{m}'. Use --list-methods to see options.")
+            print(f"  ✗  Unknown method '{m}'. Use --list-methods.");
             sys.exit(1)
 
-    # ── Input / demo ──────────────────────────────────────────────────────────
     label_tsv = args.labels
-
     if args.demo or not args.input:
-        print("\n  🧬  DEMO mode – generating synthetic alignment + labels …")
+        print("\n  🧬  DEMO mode …")
         input_file, label_tsv = generate_demo_alignment(n_seqs=12, n_clusters=3)
         if set(methods) == {"BLOSUM62"}:
             methods = ["PAM120", "BLOSUM62", "cosine_physico", "cosine_kmer", "kimura"]
     else:
         if not os.path.exists(args.input):
-            print(f"  ✗  Alignment file not found: '{args.input}'");
+            print(f"  ✗  File not found: '{args.input}'");
             sys.exit(1)
         input_file = args.input
 
-    # ── Run ───────────────────────────────────────────────────────────────────
     run_pipeline(
         input_file=input_file,
         methods=methods,
@@ -1394,6 +1614,9 @@ if __name__ == "__main__":
         cosine_k=args.cosine_k,
         fmt=args.format,
         output_prefix=args.output,
+        output_format=args.output_format,
+        dpi=args.dpi,
+        pdf_report=not args.no_pdf_report,
         show_plots=not args.no_show,
         save_matrices=not args.no_save_matrix,
         compare_methods=not args.no_compare,
