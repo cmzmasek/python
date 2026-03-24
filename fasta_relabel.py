@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +959,54 @@ def _query_pdb(accession: str) -> dict:
 # ---------------------------------------------------------------------------
 
 _cache: dict[str, dict] = {}
+_disk_cache_keys: set[str] = set()   # keys that came from the disk cache
+_disk_cache_hits: int = 0            # lookups served from the disk cache
+
+
+# ---------------------------------------------------------------------------
+# Persistent disk cache  (JSON, human-readable)
+# ---------------------------------------------------------------------------
+
+def load_disk_cache(path: Path) -> int:
+    """Merge a JSON cache file into the in-memory ``_cache``.
+
+    Returns the number of entries loaded.  Missing or corrupted files are
+    handled gracefully — a warning is printed and the run continues without
+    cached data.
+    """
+    if not path.is_file():
+        return 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"Warning: could not read cache file {path}: {exc}", file=sys.stderr)
+        return 0
+    if not isinstance(data, dict):
+        print(f"Warning: cache file {path} is not a JSON object; ignoring", file=sys.stderr)
+        return 0
+    count = 0
+    for key, val in data.items():
+        if key not in _cache and isinstance(val, dict):
+            _cache[key] = val
+            _disk_cache_keys.add(key)
+            count += 1
+    return count
+
+
+def save_disk_cache(path: Path) -> int:
+    """Write the current in-memory cache to *path* (JSON).
+
+    Existing content is replaced so the file always reflects the full merged
+    cache (pre-existing entries + new entries from this run).  Returns the
+    number of entries written.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_cache, indent=2, ensure_ascii=False), encoding="utf-8")
+        return len(_cache)
+    except OSError as exc:
+        print(f"Warning: could not write cache file {path}: {exc}", file=sys.stderr)
+        return 0
 
 
 def fetch_info(
@@ -970,10 +1018,13 @@ def fetch_info(
     verbose: bool,
 ) -> tuple[Optional[dict], str]:
     """Return (info_dict_or_None, error_string)."""
+    global _disk_cache_hits
     # Include nucl_type in the cache key so changing --nucl-type always
     # produces the correct result (UniProt re-picked; NCBI unaffected).
     key = f"{db}:{accession}:{nucl_type}"
     if key in _cache:
+        if key in _disk_cache_keys:
+            _disk_cache_hits += 1
         return _cache[key], ""
     try:
         if verbose:
@@ -2384,6 +2435,17 @@ CONFIG FILE  (--config FILE)
              "See CONFIG FILE section below for the expected format.",
     )
 
+    # ── Persistent lookup cache ───────────────────────────────────────────────
+    parser.add_argument(
+        "--cache-file",
+        metavar="FILE",
+        help="Path to a JSON file used to persist database lookup results across "
+             "runs.  Entries already present in the file are used without making "
+             "a network request; newly fetched entries are appended on exit.  "
+             "If the file does not exist it is created on the first run.  "
+             "Example: --cache-file ~/.fasta_relabel_cache.json",
+    )
+
     # ── Misc ─────────────────────────────────────────────────────────────────
     parser.add_argument(
         "--spaces", action="store_true",
@@ -2726,6 +2788,13 @@ def main(argv: Optional[list[str]] = None) -> None:
         go_category=go_category,
     )
 
+    # ── Persistent cache: load ───────────────────────────────────────────────
+    cache_path: Optional[Path] = Path(args.cache_file) if args.cache_file else None
+    if cache_path is not None:
+        n_loaded = load_disk_cache(cache_path)
+        if n_loaded:
+            print(f"  Cache: loaded {n_loaded} entries from {cache_path}", file=sys.stderr)
+
     t_start = time.monotonic()
     all_results: list[RecordResult] = []
     skipped_fasta = 0
@@ -2764,6 +2833,16 @@ def main(argv: Optional[list[str]] = None) -> None:
                 print(f"Per-file report → {per_report_path}", file=sys.stderr)
 
     elapsed = time.monotonic() - t_start
+
+    # ── Persistent cache: save ───────────────────────────────────────────────
+    if cache_path is not None:
+        n_saved = save_disk_cache(cache_path)
+        n_new = n_saved - len(_disk_cache_keys)
+        print(
+            f"  Cache: saved {n_saved} entries to {cache_path} "
+            f"({n_new} new, {_disk_cache_hits} hits from disk)",
+            file=sys.stderr,
+        )
 
     if skipped_fasta:
         print(
