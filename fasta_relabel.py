@@ -57,29 +57,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
-
 VERSION = "1.1.0"
-
 
 # ---------------------------------------------------------------------------
 # Rate-limiting helpers
 # ---------------------------------------------------------------------------
 
-NCBI_INTERVAL     = 0.34    # ≤3 req/s without an API key
-UNIPROT_INTERVAL  = 0.10
-ENSEMBL_INTERVAL  = 0.15    # conservative; Ensembl REST allows ~6-7 req/s unauthenticated
-INTERPRO_INTERVAL = 0.20    # EBI servers: ~5 req/s to be safe
-PDB_INTERVAL      = 0.10    # RCSB is generous; 10 req/s is well within limits
+NCBI_INTERVAL = 0.34  # ≤3 req/s without an API key
+UNIPROT_INTERVAL = 0.10
+ENSEMBL_INTERVAL = 0.15  # conservative; Ensembl REST allows ~6-7 req/s unauthenticated
+INTERPRO_INTERVAL = 0.20  # EBI servers: ~5 req/s to be safe
+PDB_INTERVAL = 0.10  # RCSB is generous; 10 req/s is well within limits
 
-_last_ncbi_request:     float = 0.0
-_last_uniprot_request:  float = 0.0
-_last_ensembl_request:  float = 0.0
+_last_ncbi_request: float = 0.0
+_last_uniprot_request: float = 0.0
+_last_ensembl_request: float = 0.0
 _last_interpro_request: float = 0.0
-_last_pdb_request:      float = 0.0
+_last_pdb_request: float = 0.0
 
 # Default HTTP retry settings (overridden by --retries)
 HTTP_RETRIES: int = 3
-HTTP_BACKOFF: float = 1.0   # initial sleep seconds; doubles on each retry
+HTTP_BACKOFF: float = 1.0  # initial sleep seconds; doubles on each retry
 
 
 def _throttle(interval: float, last_t: float) -> float:
@@ -186,11 +184,11 @@ def _write_fasta_record(fh, header: str, seq: str, wrap: int = 60) -> None:
     """Write a single FASTA record to an already-open file handle."""
     fh.write(f">{header}\n")
     for i in range(0, len(seq), wrap):
-        fh.write(seq[i : i + wrap] + "\n")
+        fh.write(seq[i: i + wrap] + "\n")
 
 
 def write_fasta(
-    path: Path, records: list[tuple[str, str]], wrap: int = 60, overwrite: bool = True
+        path: Path, records: list[tuple[str, str]], wrap: int = 60, overwrite: bool = True
 ) -> bool:
     """Write FASTA records to *path*; return False (and skip) if file exists and overwrite=False."""
     if not _check_overwrite(path, overwrite):
@@ -207,9 +205,9 @@ def write_fasta(
 # ---------------------------------------------------------------------------
 
 # Ambiguity character sets for amino-acid and nucleotide sequences
-_AMBIGUOUS_AA   = frozenset("BXZJbxzj")
+_AMBIGUOUS_AA = frozenset("BXZJbxzj")
 _AMBIGUOUS_NUCL = frozenset("NRYSWKMBDHVnryswkmbdhv")
-_CORE_NUCL      = frozenset("ACGTUacgtu")
+_CORE_NUCL = frozenset("ACGTUacgtu")
 
 
 def _detect_molecule_type(seq: str) -> str:
@@ -249,14 +247,14 @@ def _ambiguous_ratio(seq: str, amb_chars: frozenset) -> float:
 
 
 def apply_sequence_filters(
-    records: list[tuple[str, str]],
-    source_file: str,
-    min_len: Optional[int],
-    max_len: Optional[int],
-    max_ambiguous_ratio: Optional[float],
-    dedupe_sequence: bool,
-    sample: Optional[int],
-    molecule_type: str,          # 'auto' | 'prot' | 'nucl'
+        records: list[tuple[str, str]],
+        source_file: str,
+        min_len: Optional[int],
+        max_len: Optional[int],
+        max_ambiguous_ratio: Optional[float],
+        dedupe_sequence: bool,
+        sample: Optional[int],
+        molecule_type: str,  # 'auto' | 'prot' | 'nucl'
 ) -> tuple[list[tuple[str, str]], list["RecordResult"]]:
     """Apply pre-lookup filters to *records*.
 
@@ -316,7 +314,7 @@ def apply_sequence_filters(
 
 
 def _filtered_result(
-    source_file: str, header: str, seq: str, reason: str
+        source_file: str, header: str, seq: str, reason: str
 ) -> "RecordResult":
     """Build a minimal ``RecordResult`` for a record dropped by a pre-lookup filter."""
     return RecordResult(
@@ -352,9 +350,9 @@ def _post_lookup_filter_reason(res: "RecordResult", cfg: "ProcessConfig") -> str
 
     Records with no organism/taxid/lineage (lookup failed) are never filtered.
     """
-    org     = res.organism or ""
-    taxid   = res.taxid    or ""
-    lineage = res.lineage  or ""
+    org = res.organism or ""
+    taxid = res.taxid or ""
+    lineage = res.lineage or ""
 
     if taxid and cfg.taxid_exclude and taxid in cfg.taxid_exclude:
         return f"taxid excluded: {taxid}"
@@ -372,25 +370,25 @@ def _post_lookup_filter_reason(res: "RecordResult", cfg: "ProcessConfig") -> str
 
 
 def apply_post_lookup_filters(
-    results: list["RecordResult"],
-    new_records: list[tuple[str, str]],
-    cfg: "ProcessConfig",
+        results: list["RecordResult"],
+        new_records: list[tuple[str, str]],
+        cfg: "ProcessConfig",
 ) -> tuple[list["RecordResult"], list[tuple[str, str]], list["RecordResult"]]:
     """Apply all post-lookup filters in one pass.
 
     Returns ``(kept_results, kept_records, dropped_results)``.
     """
     any_filter = (
-        cfg.organism_include or cfg.organism_exclude
-        or cfg.taxid_include or cfg.taxid_exclude
-        or cfg.lineage_include or cfg.lineage_exclude
+            cfg.organism_include or cfg.organism_exclude
+            or cfg.taxid_include or cfg.taxid_exclude
+            or cfg.lineage_include or cfg.lineage_exclude
     )
     if not any_filter:
         return results, new_records, []
 
-    kept_results:   list[RecordResult]       = []
-    kept_records:   list[tuple[str, str]]    = []
-    dropped_results: list[RecordResult]      = []
+    kept_results: list[RecordResult] = []
+    kept_records: list[tuple[str, str]] = []
+    dropped_results: list[RecordResult] = []
 
     for res, rec in zip(results, new_records):
         reason = _post_lookup_filter_reason(res, cfg)
@@ -481,10 +479,10 @@ def _match_token(token: str, db_hint: str) -> Optional[tuple[str, str]]:
 
 
 def detect_id(
-    header: str,
-    db_hint: str,
-    id_delimiter: Optional[str] = None,
-    id_field: Optional[int] = None,
+        header: str,
+        db_hint: str,
+        id_delimiter: Optional[str] = None,
+        id_field: Optional[int] = None,
 ) -> Optional[tuple[str, str]]:
     """Return ``(db, accession)`` extracted from a FASTA header line, or ``None``.
 
@@ -541,7 +539,7 @@ def detect_id(
 # Molecule-type preference orders for --nucl-type
 _NUCL_TYPE_PREF: dict[str, list[str]] = {
     "genomic": ["Genomic_DNA", "Genomic_RNA", "mRNA", "Transcribed_RNA", "Other_RNA"],
-    "mrna":    ["mRNA", "Transcribed_RNA", "Other_RNA", "Genomic_DNA", "Genomic_RNA"],
+    "mrna": ["mRNA", "Transcribed_RNA", "Other_RNA", "Genomic_DNA", "Genomic_RNA"],
     # "any" = first EMBL entry regardless of type (handled separately)
 }
 
@@ -585,7 +583,6 @@ def _nucl_id_from_uniprot(data: dict, nucl_type: str) -> tuple[str, list[str]]:
     return embl_refs[0]["id"], all_ids  # ultimate fallback
 
 
-
 # ---------------------------------------------------------------------------
 # Shared info-dict factory
 # ---------------------------------------------------------------------------
@@ -610,9 +607,9 @@ def _empty_info(accession: str, entry_name: str = "") -> dict:
         "entry_name": entry_name or accession,
         "nucl_id": "",
         "nucl_ids": [],
-        "go_terms": [],    # list of "GO:XXXXXXX name" strings
+        "go_terms": [],  # list of "GO:XXXXXXX name" strings
         "ec_numbers": [],  # list of EC number strings, e.g. ["3.4.21.4"]
-        "xrefs": [],       # list of cross-ref strings, e.g. ["PDB:4HHB", "Ensembl:ENSP00000000233"]
+        "xrefs": [],  # list of cross-ref strings, e.g. ["PDB:4HHB", "Ensembl:ENSP00000000233"]
     }
 
 
@@ -661,9 +658,9 @@ def _query_uniprot(accession: str, nucl_type: str) -> dict:
     # EC numbers from recommended / alternative / submission names
     ec_set: list[str] = []
     for name_block in (
-        [pd_.get("recommendedName") or {}]
-        + (pd_.get("alternativeNames") or [])
-        + (pd_.get("submissionNames") or [])
+            [pd_.get("recommendedName") or {}]
+            + (pd_.get("alternativeNames") or [])
+            + (pd_.get("submissionNames") or [])
     ):
         for ec in name_block.get("ecNumbers") or []:
             v = ec.get("value", "")
@@ -718,9 +715,9 @@ def _query_uniprot(accession: str, nucl_type: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _query_ncbi(
-    accession: str,
-    email: Optional[str],
-    api_key: Optional[str],
+        accession: str,
+        email: Optional[str],
+        api_key: Optional[str],
 ) -> dict:
     global _last_ncbi_request
     _last_ncbi_request = _throttle(NCBI_INTERVAL, _last_ncbi_request)
@@ -730,8 +727,8 @@ def _query_ncbi(
     if api_key:
         params["api_key"] = api_key
     url = (
-        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?"
-        + urllib.parse.urlencode(params)
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?"
+            + urllib.parse.urlencode(params)
     )
     return _parse_ncbi_xml(_get(url), accession)
 
@@ -1059,8 +1056,8 @@ def _query_pdb(accession: str) -> dict:
 # ---------------------------------------------------------------------------
 
 _cache: dict[str, dict] = {}
-_disk_cache_keys: set[str] = set()   # keys that came from the disk cache
-_disk_cache_hits: int = 0            # lookups served from the disk cache
+_disk_cache_keys: set[str] = set()  # keys that came from the disk cache
+_disk_cache_hits: int = 0  # lookups served from the disk cache
 
 
 # ---------------------------------------------------------------------------
@@ -1113,12 +1110,12 @@ def save_disk_cache(path: Path) -> int:
 
 
 def fetch_info(
-    accession: str,
-    db: str,
-    email: Optional[str],
-    api_key: Optional[str],
-    nucl_type: str,
-    verbose: bool,
+        accession: str,
+        db: str,
+        email: Optional[str],
+        api_key: Optional[str],
+        nucl_type: str,
+        verbose: bool,
 ) -> tuple[Optional[dict], str]:
     """Return (info_dict_or_None, error_string)."""
     global _disk_cache_hits
@@ -1196,11 +1193,9 @@ _ALIASES: dict[str, str] = {
     "cross_refs": "xrefs",
 }
 
-
 # Cache: format string → list of (placeholder, canonical_field) for only the aliases
 # actually present in that string.  Built once per unique format string.
 _fmt_substitutions: dict[str, list[tuple[str, str]]] = {}
-
 
 _GO_CAT_PREFIX_RE = re.compile(r"^[A-Z]:")
 
@@ -1222,12 +1217,12 @@ def _go_cat_prefixes(go_category: set) -> set[str]:
 
 
 def format_header(
-    fmt: str,
-    info: dict,
-    use_underscores: bool = True,
-    max_go: Optional[int] = None,
-    max_ec: Optional[int] = None,
-    go_category: Optional[set] = None,
+        fmt: str,
+        info: dict,
+        use_underscores: bool = True,
+        max_go: Optional[int] = None,
+        max_ec: Optional[int] = None,
+        go_category: Optional[set] = None,
 ) -> str:
     if fmt not in _fmt_substitutions:
         _fmt_substitutions[fmt] = [
@@ -1262,27 +1257,29 @@ def format_header(
 
 @dataclasses.dataclass
 class RecordResult:
-    source_file: str        # input filename (basename)
+    source_file: str  # input filename (basename)
     original_header: str
     accession: str
-    db_used: str            # 'uniprot' | 'ncbi'
+    db_used: str  # 'uniprot' | 'ncbi'
     seq_len: int
-    relabeled: bool         # False if lookup failed
+    relabeled: bool  # False if lookup failed
     new_header: str
     organism: str = ""
     protein_name: str = ""
     gene: str = ""
     taxid: str = ""
     lineage: str = ""
-    nucl_id: str = ""                                           # chosen nucleotide/genome accession
-    nucl_ids: list = dataclasses.field(default_factory=list)    # full list of linked nucleotide accessions
-    go_terms: list = dataclasses.field(default_factory=list)    # GO term strings e.g. ["GO:0004252 serine-type endopeptidase activity"]
+    nucl_id: str = ""  # chosen nucleotide/genome accession
+    nucl_ids: list = dataclasses.field(default_factory=list)  # full list of linked nucleotide accessions
+    go_terms: list = dataclasses.field(
+        default_factory=list)  # GO term strings e.g. ["GO:0004252 serine-type endopeptidase activity"]
     ec_numbers: list = dataclasses.field(default_factory=list)  # EC numbers e.g. ["3.4.21.4"]
-    xrefs: list = dataclasses.field(default_factory=list)       # cross-ref strings e.g. ["PDB:4HHB", "Ensembl:ENSP00000000233"]
-    original_seq: str = ""                                      # populated only when --failed is active
-    error: str = ""                                             # non-empty when lookup failed
-    filtered: bool = False                                      # True when dropped by a sequence filter
-    filter_reason: str = ""                                     # human-readable reason for filtering
+    xrefs: list = dataclasses.field(
+        default_factory=list)  # cross-ref strings e.g. ["PDB:4HHB", "Ensembl:ENSP00000000233"]
+    original_seq: str = ""  # populated only when --failed is active
+    error: str = ""  # non-empty when lookup failed
+    filtered: bool = False  # True when dropped by a sequence filter
+    filter_reason: str = ""  # human-readable reason for filtering
 
 
 # ---------------------------------------------------------------------------
@@ -1405,10 +1402,10 @@ def _binom_sf(k: int, n: int, p: float) -> float:
 class GOEnrichmentResult:
     """Result of a single GO term enrichment test."""
     go_term: str
-    category: str       # F, P, C, or ""
-    count: int          # sequences annotated with this term
+    category: str  # F, P, C, or ""
+    count: int  # sequences annotated with this term
     total_annotated: int  # total sequences with ≥1 GO term
-    frequency: float    # count / total_annotated
+    frequency: float  # count / total_annotated
     pvalue: float
     fdr: float = 1.0
     fold_enrichment: float = 1.0
@@ -1432,8 +1429,8 @@ def _benjamini_hochberg(pvalues: list[float]) -> list[float]:
 
 
 def go_enrichment(
-    results: list["RecordResult"],
-    fdr_cutoff: float = 0.05,
+        results: list["RecordResult"],
+        fdr_cutoff: float = 0.05,
 ) -> list[GOEnrichmentResult]:
     """Run GO enrichment analysis on relabeled sequences.
 
@@ -1518,14 +1515,14 @@ def _section(title: str) -> str:
 
 
 def build_report_text(
-    results: list[RecordResult],
-    fmt: str,
-    db: str,
-    nucl_type: str,
-    top_n: int,
-    input_files: list[Path],
-    elapsed: float,
-    go_enrichment_fdr: Optional[float] = None,
+        results: list[RecordResult],
+        fmt: str,
+        db: str,
+        nucl_type: str,
+        top_n: int,
+        input_files: list[Path],
+        elapsed: float,
+        go_enrichment_fdr: Optional[float] = None,
 ) -> str:
     lines: list[str] = []
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1549,9 +1546,9 @@ def build_report_text(
 
     # ── Filters ──────────────────────────────────────────────────────────────
     filtered = [r for r in results if r.filtered]
-    active   = [r for r in results if not r.filtered]
+    active = [r for r in results if not r.filtered]
     if filtered:
-        pre_filtered  = [r for r in filtered if not _is_post_lookup_reason(r.filter_reason)]
+        pre_filtered = [r for r in filtered if not _is_post_lookup_reason(r.filter_reason)]
         post_filtered = [r for r in filtered if _is_post_lookup_reason(r.filter_reason)]
         lines += [_section(f"FILTERS  ({len(filtered)} removed, {len(active)} kept)")]
         if pre_filtered:
@@ -1756,11 +1753,11 @@ def build_report_text(
 
 
 def _render_distribution(
-    lines: list[str],
-    title: str,
-    counts: Counter,
-    total: int,
-    top_n: int,
+        lines: list[str],
+        title: str,
+        counts: Counter,
+        total: int,
+        top_n: int,
 ) -> None:
     unique = len(counts)
     shown = min(top_n, unique)
@@ -1811,13 +1808,13 @@ def build_report_tsv(results: list[RecordResult]) -> str:
 # ---------------------------------------------------------------------------
 
 def build_report_json(
-    results: list[RecordResult],
-    fmt: str,
-    db: str,
-    nucl_type: str,
-    input_files: list[Path],
-    elapsed: float,
-    go_enrichment_fdr: Optional[float] = None,
+        results: list[RecordResult],
+        fmt: str,
+        db: str,
+        nucl_type: str,
+        input_files: list[Path],
+        elapsed: float,
+        go_enrichment_fdr: Optional[float] = None,
 ) -> str:
     active = [r for r in results if not r.filtered]
     filtered = [r for r in results if r.filtered]
@@ -1928,15 +1925,15 @@ _REPORT_EXT: dict[str, str] = {"text": ".txt", "tsv": ".tsv", "json": ".json"}
 
 
 def _render_report(
-    results: list[RecordResult],
-    fmt: str,
-    db: str,
-    nucl_type: str,
-    top_n: int,
-    input_files: list[Path],
-    elapsed: float,
-    report_format: str,
-    go_enrichment_fdr: Optional[float] = None,
+        results: list[RecordResult],
+        fmt: str,
+        db: str,
+        nucl_type: str,
+        top_n: int,
+        input_files: list[Path],
+        elapsed: float,
+        report_format: str,
+        go_enrichment_fdr: Optional[float] = None,
 ) -> str:
     """Dispatch to the correct report builder and return the rendered string."""
     if report_format == "tsv":
@@ -1960,9 +1957,9 @@ def _safe_write(path: Path, content: str, overwrite: bool) -> bool:
 # ---------------------------------------------------------------------------
 
 def write_rename_map(
-    path: Path,
-    results: list[RecordResult],
-    overwrite: bool,
+        path: Path,
+        results: list[RecordResult],
+        overwrite: bool,
 ) -> bool:
     """Write a two-column TSV mapping original_header → new_header."""
     if not _check_overwrite(path, overwrite):
@@ -1980,7 +1977,7 @@ def write_rename_map(
 # FASTA validation mode
 # ---------------------------------------------------------------------------
 
-_LEGAL_AA   = frozenset("ACDEFGHIKLMNPQRSTVWYXBZJUOacdefghiklmnpqrstvwyxbzjuo*-.")
+_LEGAL_AA = frozenset("ACDEFGHIKLMNPQRSTVWYXBZJUOacdefghiklmnpqrstvwyxbzjuo*-.")
 _LEGAL_NUCL = frozenset("ACGTUNRYSWKMBDHVacgtunryswkmbdhv*-.")
 
 
@@ -2071,7 +2068,8 @@ def format_validation_report(results: list[dict]) -> str:
             lines.append("")
             continue
         lines.append(f"  Molecule type: {r.get('molecule_type', 'unknown')}")
-        if not r["duplicate_ids"] and not r["empty_sequences"] and not r["illegal_characters"] and not r["malformed_headers"]:
+        if not r["duplicate_ids"] and not r["empty_sequences"] and not r["illegal_characters"] and not r[
+            "malformed_headers"]:
             lines.append("  ✓ No problems found")
         else:
             if r["duplicate_ids"]:
@@ -2112,7 +2110,7 @@ class ProgressBar:
     BAR_WIDTH = 26
 
     def __init__(self, total: int, desc: str = "", enabled: bool = True) -> None:
-        self.total = total          # 0 means "unknown / streaming"
+        self.total = total  # 0 means "unknown / streaming"
         self.current = 0
         self._desc = (desc[:22] + "…") if len(desc) > 23 else desc.ljust(23)
         self._streaming = (total == 0)
@@ -2170,24 +2168,24 @@ class ProcessConfig:
     max_ambiguous_ratio: Optional[float] = None
     dedupe_sequence: bool = False
     sample: Optional[int] = None
-    molecule_type: str = "auto"          # 'auto' | 'prot' | 'nucl'
-    organism_include: list = dataclasses.field(default_factory=list)   # compiled re.Patterns
-    organism_exclude: list = dataclasses.field(default_factory=list)   # compiled re.Patterns
-    taxid_include: set = dataclasses.field(default_factory=set)        # str taxids
-    taxid_exclude: set = dataclasses.field(default_factory=set)        # str taxids
-    lineage_include: list = dataclasses.field(default_factory=list)    # compiled re.Patterns
-    lineage_exclude: list = dataclasses.field(default_factory=list)    # compiled re.Patterns
+    molecule_type: str = "auto"  # 'auto' | 'prot' | 'nucl'
+    organism_include: list = dataclasses.field(default_factory=list)  # compiled re.Patterns
+    organism_exclude: list = dataclasses.field(default_factory=list)  # compiled re.Patterns
+    taxid_include: set = dataclasses.field(default_factory=set)  # str taxids
+    taxid_exclude: set = dataclasses.field(default_factory=set)  # str taxids
+    lineage_include: list = dataclasses.field(default_factory=list)  # compiled re.Patterns
+    lineage_exclude: list = dataclasses.field(default_factory=list)  # compiled re.Patterns
     streaming: bool = False
-    max_go: Optional[int] = None         # cap on GO terms included in header
-    max_ec: Optional[int] = None         # cap on EC numbers included in header
-    go_category: Optional[set] = None    # e.g. {"F", "P", "C"}; None = all categories
-    seed: Optional[int] = None           # random seed for --sample reproducibility
-    cross_ref: bool = False              # fetch cross-references between databases
-    keep_original: bool = False          # append original header as [comment]
-    failed_file: Optional[Path] = None   # write failed-lookup sequences to this file
+    max_go: Optional[int] = None  # cap on GO terms included in header
+    max_ec: Optional[int] = None  # cap on EC numbers included in header
+    go_category: Optional[set] = None  # e.g. {"F", "P", "C"}; None = all categories
+    seed: Optional[int] = None  # random seed for --sample reproducibility
+    cross_ref: bool = False  # fetch cross-references between databases
+    keep_original: bool = False  # append original header as [comment]
+    failed_file: Optional[Path] = None  # write failed-lookup sequences to this file
     rename_map_file: Optional[Path] = None  # write old→new header TSV map
     go_enrichment_fdr: Optional[float] = None  # FDR cutoff; None = disabled
-    exclude_failed: bool = False               # omit failed records from output
+    exclude_failed: bool = False  # omit failed records from output
 
 
 # ---------------------------------------------------------------------------
@@ -2199,15 +2197,15 @@ _INFO_LIST_FIELDS = ("nucl_ids", "go_terms", "ec_numbers", "xrefs")
 
 
 def _build_record_result(
-    source_file: str,
-    header: str,
-    accession: str,
-    db_used: str,
-    seq_len: int,
-    info: Optional[dict],
-    new_header: str,
-    error: str = "",
-    original_seq: str = "",
+        source_file: str,
+        header: str,
+        accession: str,
+        db_used: str,
+        seq_len: int,
+        info: Optional[dict],
+        new_header: str,
+        error: str = "",
+        original_seq: str = "",
 ) -> "RecordResult":
     """Build a RecordResult from a lookup result, centralising field extraction."""
     if info is None:
@@ -2227,9 +2225,9 @@ def _build_record_result(
 
 
 def _run_lookups(
-    records: list[tuple[str, str]],
-    cfg: ProcessConfig,
-    bar: "ProgressBar",
+        records: list[tuple[str, str]],
+        cfg: ProcessConfig,
+        bar: "ProgressBar",
 ) -> list[tuple[str, str, Optional[dict], str]]:
     """Run DB lookups for all records, returning ``(db, accession, info, error)`` tuples."""
     out: list[tuple[str, str, Optional[dict], str]] = []
@@ -2256,9 +2254,9 @@ def _run_lookups(
 
 
 def process_file(
-    input_path: Path,
-    output_path: Path,
-    cfg: ProcessConfig,
+        input_path: Path,
+        output_path: Path,
+        cfg: ProcessConfig,
 ) -> list[RecordResult]:
     if cfg.streaming:
         return _process_file_streaming(input_path, output_path, cfg)
@@ -2270,11 +2268,11 @@ def process_file(
 
     # ── Pre-lookup filters (length / ambiguity / dedupe / sample) ────────
     any_pre_filter = (
-        cfg.min_len is not None
-        or cfg.max_len is not None
-        or cfg.max_ambiguous_ratio is not None
-        or cfg.dedupe_sequence
-        or cfg.sample is not None
+            cfg.min_len is not None
+            or cfg.max_len is not None
+            or cfg.max_ambiguous_ratio is not None
+            or cfg.dedupe_sequence
+            or cfg.sample is not None
     )
     filtered_results: list[RecordResult] = []
     if any_pre_filter:
@@ -2363,9 +2361,9 @@ def process_file(
 
 
 def _process_file_streaming(
-    input_path: Path,
-    output_path: Path,
-    cfg: ProcessConfig,
+        input_path: Path,
+        output_path: Path,
+        cfg: ProcessConfig,
 ) -> list[RecordResult]:
     """Process a FASTA file in streaming mode.
 
@@ -2382,7 +2380,7 @@ def _process_file_streaming(
         print(f"\n{input_path}  (streaming)", file=sys.stderr)
 
     bar = ProgressBar(
-        total=0,   # 0 → streaming / count-only mode
+        total=0,  # 0 → streaming / count-only mode
         desc=input_path.name,
         enabled=cfg.show_progress and not cfg.verbose and not cfg.dry_run,
     )
@@ -2393,14 +2391,14 @@ def _process_file_streaming(
     mol_resolved = (mol != "auto")
 
     # ── Per-record filter state ───────────────────────────────────────────
-    seen_hashes: set[int] = set()          # for --dedupe-sequence (hash-based)
+    seen_hashes: set[int] = set()  # for --dedupe-sequence (hash-based)
 
     # ── Reservoir for --sample (Vitter's Algorithm R) ─────────────────────
     # Each entry: (out_record, RecordResult) where out_record=(header, seq)
     reservoir: list[tuple[tuple[str, str], RecordResult]] = []
-    stream_total = 0          # total records that reached the reservoir stage
+    stream_total = 0  # total records that reached the reservoir stage
 
-    results:          list[RecordResult] = []
+    results: list[RecordResult] = []
     filtered_results: list[RecordResult] = []
 
     # Open output file early so we can write incrementally (skipped in dry-run)
@@ -3090,10 +3088,14 @@ CONFIG FILE  (--config FILE)
 # Try the stdlib tomllib module (Python 3.11+); fall back to a minimal parser.
 try:
     import tomllib as _tomllib
+
+
     def _toml_loads(text: str) -> dict:
         return _tomllib.loads(text)
 except ImportError:
     _tomllib = None  # type: ignore[assignment]
+
+
     def _toml_loads(text: str) -> dict:  # type: ignore[misc]
         return _parse_toml_minimal(text)
 
@@ -3230,7 +3232,7 @@ def _flatten_toml(d: dict, _out: Optional[dict] = None) -> dict:
 
 # Config keys that differ from their argparse dest name
 _CONFIG_KEY_REMAP: dict[str, str] = {
-    "format": "fmt",        # --format → dest "fmt"
+    "format": "fmt",  # --format → dest "fmt"
     "ncbi_api_key": "ncbi_api_key",  # identity, but explicit for clarity
 }
 
@@ -3268,10 +3270,10 @@ def _load_config(path: Path) -> dict:
 
 
 def resolve_output(
-    input_path: Path,
-    output_dir: Optional[str],
-    suffix: str,
-    in_place: bool,
+        input_path: Path,
+        output_dir: Optional[str],
+        suffix: str,
+        in_place: bool,
 ) -> Path:
     if in_place:
         return input_path
@@ -3285,7 +3287,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     if argv is None:
         argv = sys.argv[1:]
     argv = [
-        "--help"    if a == "-help"    else
+        "--help" if a == "-help" else
         "--version" if a == "-version" else a
         for a in argv
     ]
@@ -3382,10 +3384,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         go_category = {c.upper() for c in args.go_category}
 
     # Compile regex patterns early so bad patterns are caught before processing
-    org_include_pats  = _compile_patterns(args.organism_include)
-    org_exclude_pats  = _compile_patterns(args.organism_exclude)
-    lin_include_pats  = _compile_patterns(args.lineage_include)
-    lin_exclude_pats  = _compile_patterns(args.lineage_exclude)
+    org_include_pats = _compile_patterns(args.organism_include)
+    org_exclude_pats = _compile_patterns(args.organism_exclude)
+    lin_include_pats = _compile_patterns(args.lineage_include)
+    lin_exclude_pats = _compile_patterns(args.lineage_exclude)
     taxid_include_set = set(args.taxid_include)
     taxid_exclude_set = set(args.taxid_exclude)
 
@@ -3464,10 +3466,10 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         # ── Per-file report ─────────────────────────────────────────────────
         if (
-            file_results
-            and not args.no_report
-            and not args.no_per_file_report
-            and not args.dry_run
+                file_results
+                and not args.no_report
+                and not args.no_per_file_report
+                and not args.dry_run
         ):
             t_file = time.monotonic() - t_start
             per_report = _render_report(
