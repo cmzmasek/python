@@ -1,4 +1,30 @@
 #!/usr/bin/env python3
+
+# Copyright (c) 2026 Christian M. Zmasek
+#
+# Permission is hereby granted, free of charge, to any person
+# obtaining a copy of this software and associated
+# documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to
+# whom the Software is furnished to do so, subject to the
+# following conditions:
+#
+# The above copyright notice and this permission notice shall
+# be included in all copies or substantial portions of the
+# Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+# PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+# OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
 """
 fasta_relabel.py — Relabel FASTA description lines via UniProt / NCBI lookups.
 
@@ -6,7 +32,7 @@ Each sequence's accession is detected automatically (or forced with --db), then
 the description line is rebuilt from a user-supplied format string such as:
 
     "{organism} | {id} | {name} | {nucl_id}"
-    "{lineage}; {organism}; {id}"
+    "{lineage}>{organism}>{id}"
     "{organism}|{id}|{name}|{ec}|{go}"
 
 A detailed report on labeling coverage, sequence-length statistics, and the
@@ -32,7 +58,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 
-VERSION = "1.0.2"
+VERSION = "1.1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +148,25 @@ def parse_fasta(path: Path) -> Iterator[tuple[str, str]]:
         yield header, "".join(parts)
 
 
+def _first_token(header: str) -> str:
+    """Return the first whitespace-separated token of *header*, or *header* itself."""
+    idx = 0
+    n = len(header)
+    while idx < n and header[idx].isspace():
+        idx += 1
+    end = idx
+    while end < n and not header[end].isspace():
+        end += 1
+    return header[idx:end] if end > idx else header
+
+
+def _is_empty_seq(seq: str) -> bool:
+    """Return True if *seq* is empty or contains only whitespace."""
+    if not seq:
+        return True
+    return all(c.isspace() for c in seq)
+
+
 def _check_overwrite(path: Path, overwrite: bool) -> bool:
     """Return True if the caller should proceed; print a warning and return False otherwise.
 
@@ -177,11 +222,30 @@ def _detect_molecule_type(seq: str) -> str:
     return "nucl" if sum(1 for c in core if c in _CORE_NUCL) / len(core) >= 0.85 else "prot"
 
 
+_GAP_CHARS = frozenset("-.")
+
+
+def _ungapped(seq: str) -> str:
+    """Return *seq* with all gap characters (``-`` and ``.``) removed."""
+    return seq.translate(str.maketrans("", "", "-."))
+
+
+def _ungapped_length(seq: str) -> int:
+    """Return the number of non-gap residues in *seq*."""
+    return sum(1 for c in seq if c not in _GAP_CHARS)
+
+
+def _is_aligned(records: list[tuple[str, str]]) -> bool:
+    """Return True if any sequence in *records* contains gap characters."""
+    return any(c in _GAP_CHARS for _, seq in records[:20] for c in seq)
+
+
 def _ambiguous_ratio(seq: str, amb_chars: frozenset) -> float:
-    """Return the fraction of characters in *seq* that appear in *amb_chars*."""
-    if not seq:
+    """Return the fraction of non-gap characters in *seq* that are in *amb_chars*."""
+    ungap = _ungapped(seq)
+    if not ungap:
         return 0.0
-    return sum(1 for c in seq if c in amb_chars) / len(seq)
+    return sum(1 for c in ungap if c in amb_chars) / len(ungap)
 
 
 def apply_sequence_filters(
@@ -208,28 +272,33 @@ def apply_sequence_filters(
     else:
         amb_chars = _AMBIGUOUS_AA  # unused, but keeps the variable defined
 
+    # Detect alignment (gap characters) to adjust length/dedup logic
+    aligned = _is_aligned(records)
+
     kept: list[tuple[str, str]] = []
     dropped: list[RecordResult] = []
     seen_seqs: set[str] = set()
 
     for header, seq in records:
-        seq_upper = seq.upper()
+        effective_len = _ungapped_length(seq) if aligned else len(seq)
+        dedup_key = _ungapped(seq).upper() if aligned else seq.upper()
         reason = ""
 
-        if min_len is not None and len(seq) < min_len:
-            reason = f"too short ({len(seq)} < {min_len})"
-        elif max_len is not None and len(seq) > max_len:
-            reason = f"too long ({len(seq)} > {max_len})"
-        elif max_ambiguous_ratio is not None and _ambiguous_ratio(seq, amb_chars) > max_ambiguous_ratio:
+        if min_len is not None and effective_len < min_len:
+            reason = f"too short ({effective_len} < {min_len})"
+        elif max_len is not None and effective_len > max_len:
+            reason = f"too long ({effective_len} > {max_len})"
+        elif max_ambiguous_ratio is not None:
             ratio = _ambiguous_ratio(seq, amb_chars)
-            reason = f"ambiguous ratio {ratio:.3f} > {max_ambiguous_ratio:.3f}"
-        elif dedupe_sequence and seq_upper in seen_seqs:
+            if ratio > max_ambiguous_ratio:
+                reason = f"ambiguous ratio {ratio:.3f} > {max_ambiguous_ratio:.3f}"
+        elif dedupe_sequence and dedup_key in seen_seqs:
             reason = "duplicate sequence"
 
         if reason:
             dropped.append(_filtered_result(source_file, header, seq, reason))
         else:
-            seen_seqs.add(seq_upper)
+            seen_seqs.add(dedup_key)
             kept.append((header, seq))
 
     # Random subsample (applied last so N refers to post-filter count)
@@ -253,7 +322,7 @@ def _filtered_result(
     return RecordResult(
         source_file=source_file,
         original_header=header,
-        accession=header.split()[0] if header else "",
+        accession=_first_token(header) if header else "",
         db_used="",
         seq_len=len(seq),
         relabeled=False,
@@ -278,15 +347,7 @@ def _compile_patterns(patterns: list[str]) -> list[re.Pattern]:
     return compiled
 
 
-def _post_lookup_filter_reason(
-    res: "RecordResult",
-    org_include: list[re.Pattern],
-    org_exclude: list[re.Pattern],
-    taxid_include: set[str],
-    taxid_exclude: set[str],
-    lineage_include: list[re.Pattern],
-    lineage_exclude: list[re.Pattern],
-) -> str:
+def _post_lookup_filter_reason(res: "RecordResult", cfg: "ProcessConfig") -> str:
     """Return a non-empty reason string if *res* should be dropped, else ``''``.
 
     Records with no organism/taxid/lineage (lookup failed) are never filtered.
@@ -295,17 +356,17 @@ def _post_lookup_filter_reason(
     taxid   = res.taxid    or ""
     lineage = res.lineage  or ""
 
-    if taxid and taxid_exclude and taxid in taxid_exclude:
+    if taxid and cfg.taxid_exclude and taxid in cfg.taxid_exclude:
         return f"taxid excluded: {taxid}"
-    if taxid and taxid_include and taxid not in taxid_include:
+    if taxid and cfg.taxid_include and taxid not in cfg.taxid_include:
         return f"taxid not included: {taxid}"
-    if org and org_exclude and any(p.search(org) for p in org_exclude):
+    if org and cfg.organism_exclude and any(p.search(org) for p in cfg.organism_exclude):
         return f"organism excluded: {org}"
-    if org and org_include and not any(p.search(org) for p in org_include):
+    if org and cfg.organism_include and not any(p.search(org) for p in cfg.organism_include):
         return f"organism not included: {org}"
-    if lineage and lineage_exclude and any(p.search(lineage) for p in lineage_exclude):
+    if lineage and cfg.lineage_exclude and any(p.search(lineage) for p in cfg.lineage_exclude):
         return f"lineage excluded: {lineage}"
-    if lineage and lineage_include and not any(p.search(lineage) for p in lineage_include):
+    if lineage and cfg.lineage_include and not any(p.search(lineage) for p in cfg.lineage_include):
         return f"lineage not included: {lineage}"
     return ""
 
@@ -313,21 +374,16 @@ def _post_lookup_filter_reason(
 def apply_post_lookup_filters(
     results: list["RecordResult"],
     new_records: list[tuple[str, str]],
-    org_include: list[re.Pattern],
-    org_exclude: list[re.Pattern],
-    taxid_include: set[str],
-    taxid_exclude: set[str],
-    lineage_include: list[re.Pattern],
-    lineage_exclude: list[re.Pattern],
+    cfg: "ProcessConfig",
 ) -> tuple[list["RecordResult"], list[tuple[str, str]], list["RecordResult"]]:
     """Apply all post-lookup filters in one pass.
 
     Returns ``(kept_results, kept_records, dropped_results)``.
     """
     any_filter = (
-        org_include or org_exclude
-        or taxid_include or taxid_exclude
-        or lineage_include or lineage_exclude
+        cfg.organism_include or cfg.organism_exclude
+        or cfg.taxid_include or cfg.taxid_exclude
+        or cfg.lineage_include or cfg.lineage_exclude
     )
     if not any_filter:
         return results, new_records, []
@@ -337,11 +393,7 @@ def apply_post_lookup_filters(
     dropped_results: list[RecordResult]      = []
 
     for res, rec in zip(results, new_records):
-        reason = _post_lookup_filter_reason(
-            res, org_include, org_exclude,
-            taxid_include, taxid_exclude,
-            lineage_include, lineage_exclude,
-        )
+        reason = _post_lookup_filter_reason(res, cfg)
         if reason:
             dropped_results.append(dataclasses.replace(res, filtered=True, filter_reason=reason))
         else:
@@ -433,15 +485,18 @@ def detect_id(
     db_hint: str,
     id_delimiter: Optional[str] = None,
     id_field: Optional[int] = None,
-) -> tuple[str, str]:
-    """Return ``(db, accession)`` extracted from a FASTA header line.
+) -> Optional[tuple[str, str]]:
+    """Return ``(db, accession)`` extracted from a FASTA header line, or ``None``.
+
+    Returns ``None`` when no recognised accession pattern is found and no
+    ``--id-field`` is pinned — the caller should treat the record as failed.
 
     Parameters
     ----------
     header:
         The raw header text (without the leading ``>``).
     db_hint:
-        One of ``"auto"``, ``"uniprot"``, or ``"ncbi"``.
+        One of ``"auto"``, ``"uniprot"``, ``"ncbi"``, etc.
     id_delimiter:
         Character(s) used to split *header* into fields before searching.
         ``None`` means split on any whitespace (the default).
@@ -475,9 +530,8 @@ def detect_id(
         if hit:
             return hit
 
-    # ── Fallback: first field, pipe-stripped ─────────────────────────────────
-    first = (tokens[0].strip() if tokens else header).split("|")[-1]
-    return fallback_db, first
+    # No recognised accession pattern found
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +590,14 @@ def _nucl_id_from_uniprot(data: dict, nucl_type: str) -> tuple[str, list[str]]:
 # Shared info-dict factory
 # ---------------------------------------------------------------------------
 
+def _build_go_entry(go_id: str, go_name: str, category: str = "") -> str:
+    """Build a single GO term string with optional category prefix."""
+    prefix = f"{category}:" if category else ""
+    if go_name:
+        return f"{prefix}{go_id} {go_name}".strip()
+    return f"{prefix}{go_id}".strip()
+
+
 def _empty_info(accession: str, entry_name: str = "") -> dict:
     """Return a zeroed info dict with the canonical set of keys."""
     return {
@@ -550,7 +612,18 @@ def _empty_info(accession: str, entry_name: str = "") -> dict:
         "nucl_ids": [],
         "go_terms": [],    # list of "GO:XXXXXXX name" strings
         "ec_numbers": [],  # list of EC number strings, e.g. ["3.4.21.4"]
+        "xrefs": [],       # list of cross-ref strings, e.g. ["PDB:4HHB", "Ensembl:ENSP00000000233"]
     }
+
+
+def _is_empty_info(info: dict) -> bool:
+    """Return True if *info* has no meaningful content (all key fields blank)."""
+    return not any((
+        info.get("protein_name"),
+        info.get("organism"),
+        info.get("gene"),
+        info.get("lineage"),
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +651,7 @@ def _query_uniprot(accession: str, nucl_type: str) -> dict:
     org = data.get("organism", {})
     result["organism"] = org.get("scientificName", "")
     result["taxid"] = str(org.get("taxonId", ""))
-    result["lineage"] = "; ".join(org.get("lineage", []))
+    result["lineage"] = ">".join(org.get("lineage", []))
 
     # Nucleotide / genome ID from EMBL cross-references
     nucl_id, all_ids = _nucl_id_from_uniprot(data, nucl_type)
@@ -617,11 +690,25 @@ def _query_uniprot(accession: str, nucl_type: str) -> dict:
                 else:
                     term_name = raw
                 break
-        prefix = f"{category}:" if category else ""
-        entry = f"{prefix}{go_id} {term_name}".strip() if term_name else f"{prefix}{go_id}".strip()
+        entry = _build_go_entry(go_id, term_name, category)
         if entry:
             go_terms.append(entry)
     result["go_terms"] = go_terms
+
+    # Cross-references (PDB, Ensembl, …) — extracted from already-fetched JSON
+    xref_list: list[str] = []
+    for xref in data.get("uniProtKBCrossReferences") or []:
+        xdb = xref.get("database", "")
+        xid = xref.get("id", "")
+        if not xid:
+            continue
+        if xdb == "PDB":
+            xref_list.append(f"PDB:{xid}")
+        elif xdb == "Ensembl":
+            xref_list.append(f"Ensembl:{xid}")
+        elif xdb == "RefSeq":
+            xref_list.append(f"RefSeq:{xid}")
+    result["xrefs"] = xref_list
 
     return result
 
@@ -665,7 +752,7 @@ def _parse_ncbi_xml(xml_text: str, accession: str) -> dict:
         result["entry_name"] = av
 
     result["organism"] = gbseq.findtext(".//GBSeq_organism") or ""
-    result["lineage"] = gbseq.findtext(".//GBSeq_taxonomy") or ""
+    result["lineage"] = re.sub(r";\s*", ">", gbseq.findtext(".//GBSeq_taxonomy") or "")
 
     for feat in gbseq.findall(".//GBFeature"):
         key = feat.findtext("GBFeature_key")
@@ -706,8 +793,7 @@ def _parse_ncbi_xml(xml_text: str, accession: str) -> dict:
                     go_id = go_m.group(1) if go_m else ""
                     term = re.sub(r"\s*\[GO:\d+\]", "", qval).strip()
                     category = _GO_QUAL_CAT.get(qname, "")
-                    prefix = f"{category}:" if category else ""
-                    entry = f"{prefix}{go_id} {term}".strip() if go_id else f"{prefix}{term}".strip()
+                    entry = _build_go_entry(go_id or term, term if go_id else "", category)
                     if entry and entry not in result["go_terms"]:
                         result["go_terms"].append(entry)
         if key == "gene" and not result["gene"] and quals.get("gene"):
@@ -778,7 +864,7 @@ def _ensembl_taxonomy(species: str) -> tuple[str, str]:
                     "?content-type=application/json"
                 )
             )
-            lineage = "; ".join(
+            lineage = ">".join(
                 c["name"]
                 for c in reversed(cls)
                 if c.get("rank") not in ("no rank", None, "")
@@ -839,14 +925,21 @@ def _query_ensembl(accession: str) -> dict:
             "?content-type=application/json"
         ))
         go_terms: list[str] = []
+        xref_list: list[str] = []
         for xref in xrefs:
-            if xref.get("dbname") == "GO":
-                go_id = xref.get("primary_id", "")
+            xdb = xref.get("dbname", "")
+            xid = xref.get("primary_id", "")
+            if xdb == "GO":
                 go_name = xref.get("display_id", "") or xref.get("description", "")
-                entry = f"{go_id} {go_name}".strip() if go_name and go_name != go_id else go_id
+                entry = f"{xid} {go_name}".strip() if go_name and go_name != xid else xid
                 if entry and entry not in go_terms:
                     go_terms.append(entry)
+            elif xdb == "Uniprot_gn" and xid:
+                xref_list.append(f"UniProt:{xid}")
+            elif xdb == "PDB" and xid:
+                xref_list.append(f"PDB:{xid}")
         result["go_terms"] = go_terms
+        result["xrefs"] = xref_list
     except Exception:  # noqa: BLE001
         pass
 
@@ -885,8 +978,7 @@ def _query_interpro(accession: str) -> dict:
         go_id = go.get("identifier", "")
         go_name = go.get("name", "")
         category = (go.get("category") or {}).get("code", "")
-        prefix = f"{category}:" if category else ""
-        entry = f"{prefix}{go_id} {go_name}".strip() if go_name else f"{prefix}{go_id}".strip()
+        entry = _build_go_entry(go_id, go_name, category)
         if entry:
             go_terms.append(entry)
     result["go_terms"] = go_terms
@@ -951,6 +1043,14 @@ def _query_pdb(accession: str) -> dict:
             ec_numbers.append(ec)
     result["ec_numbers"] = ec_numbers
 
+    # Cross-references (UniProt mappings from polymer entity identifiers)
+    xref_list: list[str] = []
+    idents = entity.get("rcsb_polymer_entity_container_identifiers") or {}
+    for up_id in idents.get("uniprot_ids") or []:
+        if up_id:
+            xref_list.append(f"UniProt:{up_id}")
+    result["xrefs"] = xref_list
+
     return result
 
 
@@ -987,6 +1087,9 @@ def load_disk_cache(path: Path) -> int:
     count = 0
     for key, val in data.items():
         if key not in _cache and isinstance(val, dict):
+            # Normalize lineage separator from older cache entries
+            if "lineage" in val and isinstance(val["lineage"], str) and ";" in val["lineage"]:
+                val["lineage"] = re.sub(r";\s*", ">", val["lineage"])
             _cache[key] = val
             _disk_cache_keys.add(key)
             count += 1
@@ -1087,6 +1190,10 @@ _ALIASES: dict[str, str] = {
     "ec": "ec_numbers",
     "ec_numbers": "ec_numbers",
     "ec_number": "ec_numbers",
+    # Cross-references
+    "xrefs": "xrefs",
+    "cross_ref": "xrefs",
+    "cross_refs": "xrefs",
 }
 
 
@@ -1101,6 +1208,17 @@ _GO_CAT_PREFIX_RE = re.compile(r"^[A-Z]:")
 def _strip_go_prefix(term: str) -> str:
     """Remove the leading ``"X:"`` category prefix from a stored GO term string."""
     return _GO_CAT_PREFIX_RE.sub("", term, count=1)
+
+
+_go_cat_prefixes_cache: dict[frozenset, set[str]] = {}
+
+
+def _go_cat_prefixes(go_category: set) -> set[str]:
+    """Return precomputed set of ``'X:'`` prefixes for the requested GO categories."""
+    key = frozenset(go_category)
+    if key not in _go_cat_prefixes_cache:
+        _go_cat_prefixes_cache[key] = {f"{c}:" for c in go_category}
+    return _go_cat_prefixes_cache[key]
 
 
 def format_header(
@@ -1123,9 +1241,8 @@ def format_header(
         if isinstance(val, list):
             if field == "go_terms":
                 if go_category is not None:
-                    # Keep only terms whose leading category code is in the requested set.
-                    # Terms with no prefix (unknown category) are excluded when filtering.
-                    val = [t for t in val if t[:2] in {f"{c}:" for c in go_category}]
+                    prefixes = _go_cat_prefixes(go_category)
+                    val = [t for t in val if t[:2] in prefixes]
                 if max_go is not None:
                     val = val[:max_go]
                 val = [_strip_go_prefix(t) for t in val]
@@ -1161,6 +1278,8 @@ class RecordResult:
     nucl_ids: list = dataclasses.field(default_factory=list)    # full list of linked nucleotide accessions
     go_terms: list = dataclasses.field(default_factory=list)    # GO term strings e.g. ["GO:0004252 serine-type endopeptidase activity"]
     ec_numbers: list = dataclasses.field(default_factory=list)  # EC numbers e.g. ["3.4.21.4"]
+    xrefs: list = dataclasses.field(default_factory=list)       # cross-ref strings e.g. ["PDB:4HHB", "Ensembl:ENSP00000000233"]
+    original_seq: str = ""                                      # populated only when --failed is active
     error: str = ""                                             # non-empty when lookup failed
     filtered: bool = False                                      # True when dropped by a sequence filter
     filter_reason: str = ""                                     # human-readable reason for filtering
@@ -1218,6 +1337,170 @@ def _fmt_float(f: float, dp: int = 1) -> str:
 
 
 # ---------------------------------------------------------------------------
+# GO enrichment analysis
+# ---------------------------------------------------------------------------
+
+def _log_choose(n: int, k: int) -> float:
+    """Return ln(C(n, k)) using lgamma for large-value stability."""
+    if k < 0 or k > n:
+        return float("-inf")
+    return math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
+
+
+def _normal_sf(z: float) -> float:
+    """Upper-tail probability of the standard normal: P(Z >= z).
+
+    Uses the Abramowitz & Stegun rational approximation (formula 26.2.17),
+    accurate to ~1.5e-7.  Sufficient for the normal-approximation branch of
+    the binomial test.
+    """
+    if z < 0:
+        return 1.0 - _normal_sf(-z)
+    # Constants from A&S 26.2.17
+    b1, b2, b3, b4, b5 = (
+        0.319381530, -0.356563782, 1.781477937, -1.821255978, 1.330274429,
+    )
+    pp = 0.2316419
+    t = 1.0 / (1.0 + pp * z)
+    t2 = t * t
+    t3 = t2 * t
+    pdf = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+    return pdf * (b1 * t + b2 * t2 + b3 * t3 + b4 * t2 * t2 + b5 * t2 * t3)
+
+
+def _binom_sf(k: int, n: int, p: float) -> float:
+    """One-tailed (upper) binomial p-value: P(X >= k) where X ~ Bin(n, p).
+
+    Used for self-contained GO enrichment where the background is the dataset
+    itself.  For each term T we test whether the observed count *k* out of *n*
+    annotated sequences is significantly greater than expected under a uniform
+    model where each term has probability *p* = 1 / n_unique_terms.
+
+    For large *n* (>1000) where exact summation would be slow, falls back to a
+    continuity-corrected normal approximation.
+    """
+    if p <= 0.0:
+        return 0.0 if k > 0 else 1.0
+    if p >= 1.0:
+        return 1.0
+    # Normal approximation for large n (avoids O(n-k) exp/lgamma calls)
+    if n > 1000:
+        mu = n * p
+        sigma = math.sqrt(n * p * (1.0 - p))
+        if sigma < 1e-12:
+            return 0.0 if k > mu else 1.0
+        z = (k - 0.5 - mu) / sigma  # continuity correction
+        return max(0.0, min(1.0, _normal_sf(z)))
+    log_p = math.log(p)
+    log_1mp = math.log(1.0 - p)
+    total = 0.0
+    for i in range(k, n + 1):
+        total += math.exp(_log_choose(n, i) + i * log_p + (n - i) * log_1mp)
+        if total >= 1.0:
+            return 1.0
+    return min(total, 1.0)
+
+
+@dataclasses.dataclass
+class GOEnrichmentResult:
+    """Result of a single GO term enrichment test."""
+    go_term: str
+    category: str       # F, P, C, or ""
+    count: int          # sequences annotated with this term
+    total_annotated: int  # total sequences with ≥1 GO term
+    frequency: float    # count / total_annotated
+    pvalue: float
+    fdr: float = 1.0
+    fold_enrichment: float = 1.0
+
+
+def _benjamini_hochberg(pvalues: list[float]) -> list[float]:
+    """Return Benjamini-Hochberg FDR-adjusted p-values."""
+    n = len(pvalues)
+    if n == 0:
+        return []
+    indexed = sorted(enumerate(pvalues), key=lambda x: x[1])
+    fdr = [0.0] * n
+    prev = 1.0
+    for rank_minus1 in range(n - 1, -1, -1):
+        orig_idx, pv = indexed[rank_minus1]
+        rank = rank_minus1 + 1
+        adjusted = min(pv * n / rank, prev)
+        fdr[orig_idx] = min(adjusted, 1.0)
+        prev = fdr[orig_idx]
+    return fdr
+
+
+def go_enrichment(
+    results: list["RecordResult"],
+    fdr_cutoff: float = 0.05,
+) -> list[GOEnrichmentResult]:
+    """Run GO enrichment analysis on relabeled sequences.
+
+    Uses a hypergeometric test per GO term: for each term, tests whether
+    the number of sequences annotated with it is greater than expected
+    if annotations were distributed uniformly across all unique terms.
+
+    Returns a list of enriched terms sorted by FDR then p-value.
+    """
+    # Collect per-sequence GO term sets (deduplicated within each sequence)
+    annotated = [r for r in results if not r.filtered and r.relabeled and r.go_terms]
+    if not annotated:
+        return []
+
+    total_annotated = len(annotated)
+
+    # Count how many sequences carry each term
+    term_seq_counts: Counter = Counter()
+    for r in annotated:
+        for term in set(r.go_terms):  # deduplicate within sequence
+            term_seq_counts[term] += 1
+
+    n_unique_terms = len(term_seq_counts)
+    if n_unique_terms <= 1:
+        return []
+
+    # Under the null hypothesis each term has equal probability of appearing
+    # in any annotated sequence: p = 1 / n_unique_terms.
+    null_p = 1.0 / n_unique_terms
+
+    # Binomial test per term
+    raw_results: list[GOEnrichmentResult] = []
+    pvalues: list[float] = []
+
+    for term, count in term_seq_counts.items():
+        # Extract category prefix if present
+        category = term[0] if len(term) >= 2 and term[1] == ":" else ""
+
+        freq = count / total_annotated
+        fold = freq / null_p
+
+        # Binomial upper-tail: P(X >= count) where X ~ Bin(total_annotated, null_p)
+        pv = _binom_sf(count, total_annotated, null_p)
+
+        raw_results.append(GOEnrichmentResult(
+            go_term=term,
+            category=category,
+            count=count,
+            total_annotated=total_annotated,
+            frequency=freq,
+            pvalue=pv,
+            fold_enrichment=fold,
+        ))
+        pvalues.append(pv)
+
+    # FDR correction
+    fdrs = _benjamini_hochberg(pvalues)
+    for res, fdr_val in zip(raw_results, fdrs):
+        res.fdr = fdr_val
+
+    # Filter by FDR and sort
+    enriched = [r for r in raw_results if r.fdr <= fdr_cutoff]
+    enriched.sort(key=lambda r: (r.fdr, r.pvalue))
+    return enriched
+
+
+# ---------------------------------------------------------------------------
 # Report building
 # ---------------------------------------------------------------------------
 
@@ -1242,6 +1525,7 @@ def build_report_text(
     top_n: int,
     input_files: list[Path],
     elapsed: float,
+    go_enrichment_fdr: Optional[float] = None,
 ) -> str:
     lines: list[str] = []
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1360,6 +1644,53 @@ def build_report_text(
         go_counts: Counter = Counter(go_all)
         _render_distribution(lines, "GO TERM DISTRIBUTION", go_counts, total, top_n)
 
+    # ── GO enrichment analysis ────────────────────────────────────────────────
+    if go_enrichment_fdr is not None:
+        enriched = go_enrichment(results, fdr_cutoff=go_enrichment_fdr)
+        if enriched:
+            lines += [_section(
+                f"GO ENRICHMENT ANALYSIS  "
+                f"(FDR ≤ {go_enrichment_fdr}, {len(enriched)} enriched terms)"
+            )]
+            cat_names = {"F": "MF", "P": "BP", "C": "CC", "": "??"}
+            lines.append(
+                f"  {'Cat':<4} {'GO term':<42} {'Count':>5} {'Freq':>6} "
+                f"{'Fold':>6} {'p-value':>10} {'FDR':>10}"
+            )
+            lines.append("  " + "─" * 86)
+            for er in enriched:
+                term_display = _strip_go_prefix(er.go_term)
+                if len(term_display) > 41:
+                    term_display = term_display[:40] + "…"
+                cat_label = cat_names.get(er.category, er.category)
+                lines.append(
+                    f"  {cat_label:<4} {term_display:<42} {er.count:>5} "
+                    f"{er.frequency:>5.1%} {er.fold_enrichment:>6.1f}x "
+                    f"{er.pvalue:>10.2e} {er.fdr:>10.2e}"
+                )
+            lines.append("")
+            lines.append(f"  Total annotated sequences: {_fmt_int(enriched[0].total_annotated)}")
+            # Category summary
+            cat_counts: Counter = Counter(er.category for er in enriched)
+            if any(c for c in cat_counts):
+                parts = [f"{cat_names.get(c, c)}: {n}" for c, n in sorted(cat_counts.items()) if c]
+                lines.append(f"  Enriched by category: {', '.join(parts)}")
+        else:
+            lines += [_section(
+                f"GO ENRICHMENT ANALYSIS  (FDR ≤ {go_enrichment_fdr}, no enriched terms)"
+            )]
+
+    # ── Cross-reference distribution ─────────────────────────────────────────
+    xref_dbs = [x.split(":")[0] for r in active if r.relabeled for x in r.xrefs]
+    if xref_dbs:
+        xref_db_counts: Counter = Counter(xref_dbs)
+        with_xrefs = sum(1 for r in active if r.relabeled and r.xrefs)
+        lines += [_section(f"CROSS-REFERENCES  ({with_xrefs} records with xrefs)")]
+        lines.append(f"  {'Database':<30} {'Count':>8}")
+        lines.append("  " + "─" * 40)
+        for db_name, cnt in xref_db_counts.most_common():
+            lines.append(f"  {db_name:<30} {_fmt_int(cnt):>8}")
+
     # ── Nucleotide ID coverage per organism ──────────────────────────────────
     if with_nucl:
         lines += [_section("NUCLEOTIDE ID COVERAGE  (relabeled sequences only)")]
@@ -1458,7 +1789,7 @@ _TSV_FIELDS = [
     "source_file", "accession", "db_used", "relabeled",
     "seq_len", "organism", "taxid", "protein_name", "gene",
     "nucl_id", "nucl_ids", "lineage", "go_terms", "ec_numbers",
-    "new_header", "error", "filtered", "filter_reason",
+    "xrefs", "new_header", "error", "filtered", "filter_reason",
 ]
 
 
@@ -1486,6 +1817,7 @@ def build_report_json(
     nucl_type: str,
     input_files: list[Path],
     elapsed: float,
+    go_enrichment_fdr: Optional[float] = None,
 ) -> str:
     active = [r for r in results if not r.filtered]
     filtered = [r for r in results if r.filtered]
@@ -1497,6 +1829,7 @@ def build_report_json(
     prot_counts = Counter(r.protein_name or "" for r in active if r.relabeled)
     ec_counts = Counter(ec for r in active if r.relabeled for ec in r.ec_numbers)
     go_counts = Counter(gt for r in active if r.relabeled for gt in r.go_terms)
+    xref_counts = Counter(x for r in active if r.relabeled for x in r.xrefs)
 
     doc = {
         "meta": {
@@ -1545,6 +1878,23 @@ def build_report_json(
         "protein_distribution": dict(prot_counts.most_common()),
         "ec_number_distribution": dict(ec_counts.most_common()),
         "go_term_distribution": dict(go_counts.most_common()),
+        "xref_distribution": dict(xref_counts.most_common()),
+        "go_enrichment": (
+            [
+                {
+                    "go_term": er.go_term,
+                    "category": er.category,
+                    "count": er.count,
+                    "total_annotated": er.total_annotated,
+                    "frequency": round(er.frequency, 4),
+                    "fold_enrichment": round(er.fold_enrichment, 2),
+                    "pvalue": er.pvalue,
+                    "fdr": er.fdr,
+                }
+                for er in go_enrichment(results, fdr_cutoff=go_enrichment_fdr)
+            ]
+            if go_enrichment_fdr is not None else []
+        ),
         "per_file": {
             fname: {
                 "records": len(recs),
@@ -1586,13 +1936,14 @@ def _render_report(
     input_files: list[Path],
     elapsed: float,
     report_format: str,
+    go_enrichment_fdr: Optional[float] = None,
 ) -> str:
     """Dispatch to the correct report builder and return the rendered string."""
     if report_format == "tsv":
         return build_report_tsv(results)
     if report_format == "json":
-        return build_report_json(results, fmt, db, nucl_type, input_files, elapsed)
-    return build_report_text(results, fmt, db, nucl_type, top_n, input_files, elapsed)
+        return build_report_json(results, fmt, db, nucl_type, input_files, elapsed, go_enrichment_fdr)
+    return build_report_text(results, fmt, db, nucl_type, top_n, input_files, elapsed, go_enrichment_fdr)
 
 
 def _safe_write(path: Path, content: str, overwrite: bool) -> bool:
@@ -1602,6 +1953,147 @@ def _safe_write(path: Path, content: str, overwrite: bool) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return True
+
+
+# ---------------------------------------------------------------------------
+# Rename map (old→new header TSV)
+# ---------------------------------------------------------------------------
+
+def write_rename_map(
+    path: Path,
+    results: list[RecordResult],
+    overwrite: bool,
+) -> bool:
+    """Write a two-column TSV mapping original_header → new_header."""
+    if not _check_overwrite(path, overwrite):
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("original_header\tnew_header\n")
+        for r in results:
+            if not r.filtered:
+                fh.write(f"{r.original_header}\t{r.new_header}\n")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# FASTA validation mode
+# ---------------------------------------------------------------------------
+
+_LEGAL_AA   = frozenset("ACDEFGHIKLMNPQRSTVWYXBZJUOacdefghiklmnpqrstvwyxbzjuo*-.")
+_LEGAL_NUCL = frozenset("ACGTUNRYSWKMBDHVacgtunryswkmbdhv*-.")
+
+
+def validate_fasta(path: Path) -> dict:
+    """Check *path* for common FASTA problems.  Returns a dict of findings."""
+    records = list(parse_fasta(path))
+    total = len(records)
+    if total == 0:
+        return {"file": str(path), "total_records": 0, "empty_file": True,
+                "duplicate_ids": [], "empty_sequences": [], "illegal_characters": [],
+                "malformed_headers": [], "issues": 1}
+
+    # Detect molecule type from first sequence
+    mol = _detect_molecule_type(records[0][1])
+    legal_chars = _LEGAL_NUCL if mol == "nucl" else _LEGAL_AA
+
+    id_counts: Counter = Counter()
+    duplicate_ids: list[tuple[str, int]] = []
+    empty_sequences: list[str] = []
+    illegal_characters: list[tuple[str, str]] = []
+    malformed_headers: list[str] = []
+
+    for header, seq in records:
+        # Extract first token as the ID
+        tokens = header.split()
+        first_token = tokens[0] if tokens else header
+        id_counts[first_token] += 1
+
+        # Check for malformed headers
+        stripped = header.strip()
+        if not stripped or not any(c.isalnum() for c in stripped):
+            malformed_headers.append(header)
+
+        # Check for empty sequences
+        if _is_empty_seq(seq):
+            empty_sequences.append(header)
+            continue
+
+        # Check for illegal characters
+        bad_chars = set()
+        for c in seq:
+            if c not in legal_chars and not c.isspace():
+                bad_chars.add(c)
+        if bad_chars:
+            illegal_characters.append((header, "".join(sorted(bad_chars))))
+
+    # Duplicate IDs
+    for fid, cnt in id_counts.items():
+        if cnt > 1:
+            duplicate_ids.append((fid, cnt))
+
+    issues = len(duplicate_ids) + len(empty_sequences) + len(illegal_characters) + len(malformed_headers)
+
+    return {
+        "file": str(path),
+        "total_records": total,
+        "molecule_type": mol,
+        "empty_file": False,
+        "duplicate_ids": duplicate_ids,
+        "empty_sequences": empty_sequences,
+        "illegal_characters": illegal_characters,
+        "malformed_headers": malformed_headers,
+        "issues": issues,
+    }
+
+
+def format_validation_report(results: list[dict]) -> str:
+    """Build a human-readable validation report from a list of per-file results."""
+    lines: list[str] = [
+        RULE_HEAVY,
+        _center(f"fasta_relabel {VERSION}  •  Validation Report"),
+        RULE_HEAVY,
+        "",
+    ]
+    total_issues = sum(r["issues"] for r in results)
+    total_records = sum(r["total_records"] for r in results)
+    lines.append(f"  Files checked : {len(results)}")
+    lines.append(f"  Total records : {_fmt_int(total_records)}")
+    lines.append(f"  Total issues  : {_fmt_int(total_issues)}")
+    lines.append("")
+
+    for r in results:
+        lines.append(RULE_LIGHT)
+        lines.append(f"  File: {r['file']}")
+        lines.append(f"  Records: {_fmt_int(r['total_records'])}")
+        if r.get("empty_file"):
+            lines.append("  ⚠ FILE IS EMPTY (no FASTA records found)")
+            lines.append("")
+            continue
+        lines.append(f"  Molecule type: {r.get('molecule_type', 'unknown')}")
+        if not r["duplicate_ids"] and not r["empty_sequences"] and not r["illegal_characters"] and not r["malformed_headers"]:
+            lines.append("  ✓ No problems found")
+        else:
+            if r["duplicate_ids"]:
+                lines.append(f"\n  Duplicate IDs ({len(r['duplicate_ids'])}):")
+                for fid, cnt in sorted(r["duplicate_ids"], key=lambda x: -x[1])[:20]:
+                    lines.append(f"    {fid}  (×{cnt})")
+            if r["empty_sequences"]:
+                lines.append(f"\n  Empty sequences ({len(r['empty_sequences'])}):")
+                for hdr in r["empty_sequences"][:20]:
+                    lines.append(f"    >{hdr[:60]}")
+            if r["illegal_characters"]:
+                lines.append(f"\n  Illegal characters ({len(r['illegal_characters'])}):")
+                for hdr, chars in r["illegal_characters"][:20]:
+                    lines.append(f"    >{hdr[:50]}  chars: {chars}")
+            if r["malformed_headers"]:
+                lines.append(f"\n  Malformed headers ({len(r['malformed_headers'])}):")
+                for hdr in r["malformed_headers"][:20]:
+                    lines.append(f"    >{hdr[:60]}")
+        lines.append("")
+
+    lines += [RULE_HEAVY, ""]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1689,11 +2181,50 @@ class ProcessConfig:
     max_go: Optional[int] = None         # cap on GO terms included in header
     max_ec: Optional[int] = None         # cap on EC numbers included in header
     go_category: Optional[set] = None    # e.g. {"F", "P", "C"}; None = all categories
+    seed: Optional[int] = None           # random seed for --sample reproducibility
+    cross_ref: bool = False              # fetch cross-references between databases
+    keep_original: bool = False          # append original header as [comment]
+    failed_file: Optional[Path] = None   # write failed-lookup sequences to this file
+    rename_map_file: Optional[Path] = None  # write old→new header TSV map
+    go_enrichment_fdr: Optional[float] = None  # FDR cutoff; None = disabled
+    exclude_failed: bool = False               # omit failed records from output
 
 
 # ---------------------------------------------------------------------------
 # File processing
 # ---------------------------------------------------------------------------
+
+_INFO_STR_FIELDS = ("organism", "protein_name", "gene", "taxid", "lineage", "nucl_id")
+_INFO_LIST_FIELDS = ("nucl_ids", "go_terms", "ec_numbers", "xrefs")
+
+
+def _build_record_result(
+    source_file: str,
+    header: str,
+    accession: str,
+    db_used: str,
+    seq_len: int,
+    info: Optional[dict],
+    new_header: str,
+    error: str = "",
+    original_seq: str = "",
+) -> "RecordResult":
+    """Build a RecordResult from a lookup result, centralising field extraction."""
+    if info is None:
+        return RecordResult(
+            source_file=source_file, original_header=header,
+            accession=accession, db_used=db_used, seq_len=seq_len,
+            relabeled=False, new_header=new_header, error=error,
+            original_seq=original_seq,
+        )
+    return RecordResult(
+        source_file=source_file, original_header=header,
+        accession=accession, db_used=db_used, seq_len=seq_len,
+        relabeled=True, new_header=new_header,
+        **{f: info.get(f, "") for f in _INFO_STR_FIELDS},
+        **{f: info.get(f, []) for f in _INFO_LIST_FIELDS},
+    )
+
 
 def _run_lookups(
     records: list[tuple[str, str]],
@@ -1703,11 +2234,23 @@ def _run_lookups(
     """Run DB lookups for all records, returning ``(db, accession, info, error)`` tuples."""
     out: list[tuple[str, str, Optional[dict], str]] = []
     for header, _seq in records:
-        detected_db, accession = detect_id(header, cfg.db, cfg.id_delimiter, cfg.id_field)
-        info, error = fetch_info(
-            accession, detected_db, cfg.email, cfg.api_key, cfg.nucl_type, cfg.verbose
-        )
-        out.append((detected_db, accession, info, error))
+        if _is_empty_seq(_seq):
+            first_token = _first_token(header)
+            out.append(("", first_token, None, "empty sequence"))
+            bar.update()
+            continue
+        hit = detect_id(header, cfg.db, cfg.id_delimiter, cfg.id_field)
+        if hit is None:
+            first_token = _first_token(header)
+            out.append(("", first_token, None, "no recognised identifier in header"))
+        else:
+            detected_db, accession = hit
+            info, error = fetch_info(
+                accession, detected_db, cfg.email, cfg.api_key, cfg.nucl_type, cfg.verbose
+            )
+            if info is not None and _is_empty_info(info):
+                info, error = None, "database returned empty record"
+            out.append((detected_db, accession, info, error))
         bar.update()
     return out
 
@@ -1771,53 +2314,34 @@ def process_file(
     results: list[RecordResult] = []
     new_records: list[tuple[str, str]] = []
 
+    # Detect alignment for seq_len reporting
+    aligned = _is_aligned(records)
+
     for (header, seq), (detected_db, accession, info, error) in zip(records, lookups):
+        effective_len = _ungapped_length(seq) if aligned else len(seq)
         if info is None:
-            res = RecordResult(
-                source_file=input_path.name,
-                original_header=header,
-                accession=accession,
-                db_used=detected_db,
-                seq_len=len(seq),
-                relabeled=False,
-                new_header=header,
-                error=error,
-            )
-            new_records.append((header, seq))
+            if not cfg.exclude_failed:
+                new_records.append((header, seq))
+            out_header = header
         else:
             info["id"] = accession
-            new_header = format_header(cfg.fmt, info, cfg.use_underscores, cfg.max_go, cfg.max_ec, cfg.go_category)
+            out_header = format_header(cfg.fmt, info, cfg.use_underscores, cfg.max_go, cfg.max_ec, cfg.go_category)
+            if cfg.keep_original:
+                out_header = f"{out_header} [{header}]"
             if cfg.verbose:
                 nucl_note = f"  nucl_id={info['nucl_id']!r}" if info.get("nucl_id") else ""
-                print(f"  {accession!r} → {new_header!r}{nucl_note}", file=sys.stderr)
-            res = RecordResult(
-                source_file=input_path.name,
-                original_header=header,
-                accession=accession,
-                db_used=detected_db,
-                seq_len=len(seq),
-                relabeled=True,
-                new_header=new_header,
-                organism=info.get("organism", ""),
-                protein_name=info.get("protein_name", ""),
-                gene=info.get("gene", ""),
-                taxid=info.get("taxid", ""),
-                lineage=info.get("lineage", ""),
-                nucl_id=info.get("nucl_id", ""),
-                nucl_ids=info.get("nucl_ids", []),
-                go_terms=info.get("go_terms", []),
-                ec_numbers=info.get("ec_numbers", []),
-            )
-            new_records.append((new_header, seq))
-        results.append(res)
+                print(f"  {accession!r} → {out_header!r}{nucl_note}", file=sys.stderr)
+            new_records.append((out_header, seq))
+        results.append(_build_record_result(
+            input_path.name, header, accession, detected_db, effective_len,
+            info, out_header, error=error,
+            original_seq=seq if cfg.failed_file and info is None else "",
+        ))
 
     # ── Post-lookup filters (organism / taxid / lineage) ─────────────────
     post_dropped: list[RecordResult] = []
     results, new_records, post_dropped = apply_post_lookup_filters(
-        results, new_records,
-        cfg.organism_include, cfg.organism_exclude,
-        cfg.taxid_include,    cfg.taxid_exclude,
-        cfg.lineage_include,  cfg.lineage_exclude,
+        results, new_records, cfg,
     )
     if cfg.verbose and post_dropped:
         print(
@@ -1890,24 +2414,38 @@ def _process_file_streaming(
     try:
         for header, seq in parse_fasta(input_path):
 
+            # ── Empty sequence → treat as failed ─────────────────────────
+            if _is_empty_seq(seq):
+                first_token = _first_token(header)
+                results.append(_build_record_result(
+                    input_path.name, header, first_token, "", 0,
+                    None, header, error="empty sequence",
+                    original_seq="" if not cfg.failed_file else seq,
+                ))
+                bar.update()
+                continue
+
             # ── Resolve molecule type from first sequence ─────────────────
             if not mol_resolved:
                 mol = _detect_molecule_type(seq)
                 amb_chars = _AMBIGUOUS_NUCL if mol == "nucl" else _AMBIGUOUS_AA
                 mol_resolved = True
 
-            # ── Pre-lookup filters ────────────────────────────────────────
-            seq_upper = seq.upper()
+            # ── Pre-lookup filters (alignment-aware) ─────────────────────
+            ungap_seq = _ungapped(seq)
+            effective_len = len(ungap_seq)
+            dedup_key_upper = ungap_seq.upper()
             reason = ""
-            if cfg.min_len is not None and len(seq) < cfg.min_len:
-                reason = f"too short ({len(seq)} < {cfg.min_len})"
-            elif cfg.max_len is not None and len(seq) > cfg.max_len:
-                reason = f"too long ({len(seq)} > {cfg.max_len})"
-            elif cfg.max_ambiguous_ratio is not None and _ambiguous_ratio(seq, amb_chars) > cfg.max_ambiguous_ratio:
+            if cfg.min_len is not None and effective_len < cfg.min_len:
+                reason = f"too short ({effective_len} < {cfg.min_len})"
+            elif cfg.max_len is not None and effective_len > cfg.max_len:
+                reason = f"too long ({effective_len} > {cfg.max_len})"
+            elif cfg.max_ambiguous_ratio is not None:
                 ratio = _ambiguous_ratio(seq, amb_chars)
-                reason = f"ambiguous ratio {ratio:.3f} > {cfg.max_ambiguous_ratio:.3f}"
+                if ratio > cfg.max_ambiguous_ratio:
+                    reason = f"ambiguous ratio {ratio:.3f} > {cfg.max_ambiguous_ratio:.3f}"
             elif cfg.dedupe_sequence:
-                h = hash(seq_upper)
+                h = hash(dedup_key_upper)
                 if h in seen_hashes:
                     reason = "duplicate sequence"
                 else:
@@ -1919,48 +2457,47 @@ def _process_file_streaming(
                 continue
 
             # ── DB lookup ─────────────────────────────────────────────────
-            detected_db, accession = detect_id(header, cfg.db, cfg.id_delimiter, cfg.id_field)
-            info, error = fetch_info(
-                accession, detected_db, cfg.email, cfg.api_key, cfg.nucl_type, cfg.verbose
-            )
+            hit = detect_id(header, cfg.db, cfg.id_delimiter, cfg.id_field)
+            if hit is None:
+                first_token = _first_token(header)
+                detected_db, accession, info, error = "", first_token, None, "no recognised identifier in header"
+            else:
+                detected_db, accession = hit
+                info, error = fetch_info(
+                    accession, detected_db, cfg.email, cfg.api_key, cfg.nucl_type, cfg.verbose
+                )
+                if info is not None and _is_empty_info(info):
+                    info, error = None, "database returned empty record"
 
             if info is None:
-                res = RecordResult(
-                    source_file=input_path.name, original_header=header,
-                    accession=accession, db_used=detected_db,
-                    seq_len=len(seq), relabeled=False, new_header=header, error=error,
-                )
-                out_rec: tuple[str, str] = (header, seq)
+                out_header = header
             else:
                 info["id"] = accession
-                new_header = format_header(cfg.fmt, info, cfg.use_underscores, cfg.max_go, cfg.max_ec, cfg.go_category)
+                out_header = format_header(cfg.fmt, info, cfg.use_underscores, cfg.max_go, cfg.max_ec, cfg.go_category)
+                if cfg.keep_original:
+                    out_header = f"{out_header} [{header}]"
                 if cfg.verbose:
                     nucl_note = f"  nucl_id={info['nucl_id']!r}" if info.get("nucl_id") else ""
-                    print(f"  {accession!r} → {new_header!r}{nucl_note}", file=sys.stderr)
-                res = RecordResult(
-                    source_file=input_path.name, original_header=header,
-                    accession=accession, db_used=detected_db,
-                    seq_len=len(seq), relabeled=True, new_header=new_header,
-                    organism=info.get("organism", ""), protein_name=info.get("protein_name", ""),
-                    gene=info.get("gene", ""), taxid=info.get("taxid", ""),
-                    lineage=info.get("lineage", ""), nucl_id=info.get("nucl_id", ""),
-                    nucl_ids=info.get("nucl_ids", []),
-                    go_terms=info.get("go_terms", []),
-                    ec_numbers=info.get("ec_numbers", []),
-                )
-                out_rec = (new_header, seq)
+                    print(f"  {accession!r} → {out_header!r}{nucl_note}", file=sys.stderr)
+            out_rec: tuple[str, str] = (out_header, seq)
+            res = _build_record_result(
+                input_path.name, header, accession, detected_db, effective_len,
+                info, out_header, error=error,
+                original_seq=seq if cfg.failed_file and info is None else "",
+            )
 
             # ── Post-lookup filters ───────────────────────────────────────
-            post_reason = _post_lookup_filter_reason(
-                res,
-                cfg.organism_include, cfg.organism_exclude,
-                cfg.taxid_include,    cfg.taxid_exclude,
-                cfg.lineage_include,  cfg.lineage_exclude,
-            )
+            post_reason = _post_lookup_filter_reason(res, cfg)
             if post_reason:
                 filtered_results.append(
                     dataclasses.replace(res, filtered=True, filter_reason=post_reason)
                 )
+                bar.update()
+                continue
+
+            # ── Exclude failed records from output ─────────────────────
+            if cfg.exclude_failed and not res.relabeled:
+                results.append(res)
                 bar.update()
                 continue
 
@@ -2033,7 +2570,7 @@ FORMAT FIELDS  (use any alias inside curly braces)
   {name}           Protein name  [aliases: protein_name, protein]
   {organism}       Scientific organism name  [aliases: taxon, species, sci_name]
   {gene}           Gene name
-  {lineage}        Full taxonomic lineage (semicolon-separated)
+  {lineage}        Full taxonomic lineage (>-separated, no spaces)
   {taxid}          NCBI Taxonomy ID  [alias: tax_id]
   {entry_name}     UniProt entry name or GenBank accession+version  [alias: entry]
   {nucl_id}        Nucleotide / genome accession linked to this protein
@@ -2044,6 +2581,10 @@ FORMAT FIELDS  (use any alias inside curly braces)
   {go}             GO terms, semicolon-separated  [aliases: go_terms, go_ids]
                    Source: UniProt xrefs, NCBI GO_* qualifiers, InterPro metadata,
                    Ensembl xrefs.  Filter by category with --go-category F/P/C.
+  {xrefs}          Cross-references to other databases, semicolon-separated
+                   [aliases: cross_ref, cross_refs]
+                   Source: UniProt→PDB/Ensembl/RefSeq, Ensembl→UniProt/PDB,
+                   PDB→UniProt.  Requires --cross-ref to populate.
 
 NUCLEOTIDE ID TYPE  (--nucl-type)
   genomic  Prefer Genomic_DNA accessions, fall back to mRNA/other  (default)
@@ -2090,7 +2631,7 @@ EXAMPLES
   fasta_relabel sequences.fasta --format "{organism}|{id}|{name}|{ec}|{go}"
   fasta_relabel sequences.fasta --format "{id}|{ec}" --db uniprot
   fasta_relabel sequences.fasta --format "{id} {name}" --db ncbi --email me@example.com
-  fasta_relabel seqs/ --format "{lineage}; {organism}" --output renamed/
+  fasta_relabel seqs/ --format "{lineage}>{organism}" --output renamed/
   fasta_relabel a.fasta b.fasta --in-place --format "{id}|{taxon}|{name}|{genome_id}"
   fasta_relabel sequences.fasta --dry-run --format "{organism} {id} {name}"
   fasta_relabel sequences.fasta --report summary.txt
@@ -2119,6 +2660,13 @@ EXAMPLES
   fasta_relabel big.fasta --streaming --sample 1000 --lineage-include Vertebrata
   fasta_relabel sequences.fasta --config run.toml
   fasta_relabel sequences.fasta --config run.toml --dry-run  # CLI overrides config
+  fasta_relabel sequences.fasta --sample 500 --seed 42       # reproducible subsample
+  fasta_relabel sequences.fasta --cross-ref --format "{id}|{xrefs}"
+  fasta_relabel sequences.fasta --keep-original
+  fasta_relabel sequences.fasta --failed failed.fasta
+  fasta_relabel sequences.fasta --rename-map mapping.tsv
+  fasta_relabel sequences.fasta --validate                    # check only, no relabeling
+  fasta_relabel alignment.fasta --min-len 50 --dedupe-sequence  # alignment-aware
 
 CONFIG FILE  (--config FILE)
   Any long option can appear as a key in a TOML file.  Use underscores
@@ -2352,6 +2900,22 @@ CONFIG FILE  (--config FILE)
              "Example: --go-category F P",
     )
     parser.add_argument(
+        "--go-enrichment",
+        action="store_true",
+        help="Run GO enrichment analysis on relabeled sequences using a "
+             "hypergeometric test with Benjamini-Hochberg FDR correction.  "
+             "Enriched terms are included in the report.  "
+             "Use --go-enrichment-fdr to set the significance cutoff.",
+    )
+    parser.add_argument(
+        "--go-enrichment-fdr",
+        type=float,
+        default=None,
+        metavar="F",
+        help="FDR cutoff for GO enrichment analysis (default: 0.05).  "
+             "Implies --go-enrichment when set explicitly.",
+    )
+    parser.add_argument(
         "--molecule-type",
         choices=["auto", "prot", "nucl"],
         default="auto",
@@ -2405,7 +2969,7 @@ CONFIG FILE  (--config FILE)
         metavar="PATTERN",
         help="After DB lookup, keep only sequences whose full taxonomic lineage "
              "matches at least one pattern (case-insensitive regex).  Matches "
-             "against the semicolon-separated lineage string.  "
+             "against the >-separated lineage string.  "
              "Example: --lineage-include Mammalia Aves  (keep mammals or birds)",
     )
     parser.add_argument(
@@ -2424,6 +2988,56 @@ CONFIG FILE  (--config FILE)
              "Uses Vitter's reservoir sampling for --sample and hash-based "
              "deduplication for --dedupe-sequence.  "
              "The progress bar switches to a counter display (no percentage).",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Seed the random number generator for reproducible --sample runs.  "
+             "When set, the same input with the same --sample N and --seed N "
+             "always produces the same output.",
+    )
+    parser.add_argument(
+        "--cross-ref",
+        action="store_true",
+        help="Fetch cross-references between databases (UniProt↔PDB↔Ensembl) "
+             "for each sequence.  Populates the {xrefs} format placeholder and "
+             "adds a cross-reference section to reports.  No extra API calls "
+             "for UniProt/Ensembl/PDB (data is extracted from existing responses).",
+    )
+    parser.add_argument(
+        "--keep-original",
+        action="store_true",
+        help="Append the original header as a bracketed comment after the new "
+             "header, e.g. >new_header [original_header]",
+    )
+    parser.add_argument(
+        "--failed",
+        metavar="FILE",
+        help="Write sequences that failed DB lookup to a separate FASTA file "
+             "for manual curation",
+    )
+    parser.add_argument(
+        "--exclude-failed",
+        action="store_true",
+        help="Omit sequences that failed DB lookup from the output FASTA.  "
+             "Combine with --failed to save them to a separate file.",
+    )
+    parser.add_argument(
+        "--rename-map",
+        metavar="FILE",
+        help="Write a two-column TSV file mapping original headers to new "
+             "headers (useful for updating downstream files like trees or "
+             "alignments)",
+    )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Check input FASTA files for common problems (duplicate IDs, "
+             "empty sequences, illegal characters, malformed headers) and "
+             "print a validation report.  Does not relabel; exits after checking.",
     )
 
     # ── Config file ──────────────────────────────────────────────────────────
@@ -2678,6 +3292,10 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     parser = build_parser()
 
+    if not argv:
+        parser.print_help()
+        sys.exit(0)
+
     # ── Config file: applied as defaults BEFORE the full parse ───────────────
     # We scan argv manually so that --config works even when it appears anywhere
     # in the argument list, and so config defaults are set before parse_args().
@@ -2730,6 +3348,20 @@ def main(argv: Optional[list[str]] = None) -> None:
         print("Error: no input files found", file=sys.stderr)
         sys.exit(1)
 
+    # ── Validate mode: check and exit ────────────────────────────────────────
+    if args.validate:
+        val_results = [validate_fasta(p) for p in input_files]
+        report_text = format_validation_report(val_results)
+        if args.report and args.report != "-":
+            Path(args.report).write_text(report_text, encoding="utf-8")
+            print(f"Validation report → {args.report}", file=sys.stderr)
+        elif args.report == "-":
+            print(report_text)
+        else:
+            print(report_text, file=sys.stderr)
+        total_issues = sum(r["issues"] for r in val_results)
+        sys.exit(1 if total_issues > 0 else 0)
+
     # --in-place always implies overwrite (the user explicitly asked for it)
     overwrite = args.overwrite or args.in_place
 
@@ -2756,6 +3388,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     lin_exclude_pats  = _compile_patterns(args.lineage_exclude)
     taxid_include_set = set(args.taxid_include)
     taxid_exclude_set = set(args.taxid_exclude)
+
+    # ── Seed the RNG before any processing ──────────────────────────────────
+    if args.seed is not None:
+        random.seed(args.seed)
 
     cfg = ProcessConfig(
         fmt=args.fmt,
@@ -2786,6 +3422,17 @@ def main(argv: Optional[list[str]] = None) -> None:
         max_go=args.max_go,
         max_ec=args.max_ec,
         go_category=go_category,
+        seed=args.seed,
+        cross_ref=args.cross_ref,
+        keep_original=args.keep_original,
+        failed_file=Path(args.failed) if args.failed else None,
+        rename_map_file=Path(args.rename_map) if args.rename_map else None,
+        go_enrichment_fdr=(
+            args.go_enrichment_fdr if args.go_enrichment_fdr is not None
+            else 0.05 if args.go_enrichment
+            else None
+        ),
+        exclude_failed=args.exclude_failed,
     )
 
     # ── Persistent cache: load ───────────────────────────────────────────────
@@ -2826,6 +3473,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             per_report = _render_report(
                 file_results, args.fmt, args.db, args.nucl_type,
                 args.report_top, [input_path], t_file, args.report_format,
+                cfg.go_enrichment_fdr,
             )
             ext = _REPORT_EXT[args.report_format]
             per_report_path = output_path.with_name(output_path.stem + "_report" + ext)
@@ -2850,11 +3498,34 @@ def main(argv: Optional[list[str]] = None) -> None:
             file=sys.stderr,
         )
 
+    # ── Write failed-lookup sequences ────────────────────────────────────────
+    if cfg.failed_file and all_results:
+        failed_seqs = [
+            (r.original_header, r.original_seq)
+            for r in all_results
+            if not r.relabeled and not r.filtered and r.original_seq
+        ]
+        if failed_seqs:
+            if write_fasta(cfg.failed_file, failed_seqs, overwrite=overwrite):
+                print(
+                    f"Failed sequences ({len(failed_seqs)}) → {cfg.failed_file}",
+                    file=sys.stderr,
+                )
+        else:
+            print("  No failed-lookup sequences to write.", file=sys.stderr)
+
+    # ── Write rename map TSV ─────────────────────────────────────────────────
+    if cfg.rename_map_file and all_results:
+        if write_rename_map(cfg.rename_map_file, all_results, overwrite):
+            n_mapped = sum(1 for r in all_results if not r.filtered)
+            print(f"Rename map ({n_mapped} entries) → {cfg.rename_map_file}", file=sys.stderr)
+
     # ── Aggregate report ─────────────────────────────────────────────────────
     if not args.no_report and all_results:
         report_text = _render_report(
             all_results, args.fmt, args.db, args.nucl_type,
             args.report_top, input_files, elapsed, args.report_format,
+            cfg.go_enrichment_fdr,
         )
 
         if args.report == "-":
