@@ -26,15 +26,19 @@ Input: FASTA file with UniProt (sp|P12345|GENE_HUMAN) or GenBank (NP_000001.1)
 """
 from __future__ import annotations
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 import re
 import sys
 import csv
 import json
+import math
 import time
+import hashlib
+import logging
 import pathlib
 import argparse
+import tempfile
 import statistics
 import urllib.request
 import urllib.error
@@ -43,6 +47,8 @@ from dataclasses import dataclass, field
 from itertools import combinations
 from xml.etree import ElementTree as ET
 
+# Gap characters recognised in aligned sequences
+_GAP: frozenset[str] = frozenset("-.")
 
 # ---------------------------------------------------------------------------
 # Identifier parsing
@@ -84,15 +90,114 @@ def parse_identifier(header: str) -> tuple[str, str]:
 # FASTA parser
 # ---------------------------------------------------------------------------
 
-def parse_fasta(path: str) -> list[tuple[str, str, str]]:
+def _extract_org_hint(header: str) -> str:
+    """
+    Best-effort extraction of an organism name from a raw FASTA header line.
+
+    Handles:
+      UniProt  ``OS=Homo sapiens OX=...``  → ``Homo sapiens``
+      GenBank  ``... [Homo sapiens]``       → ``Homo sapiens``
+
+    Returns an empty string when nothing can be found.
+    """
+    h = header.lstrip(">").strip()
+    # UniProt OS= field
+    m = re.search(r"\bOS=(.+?)(?:\s+OX=|\s+GN=|\s+PE=|\s+SV=|$)", h)
+    if m:
+        return m.group(1).strip()
+    # GenBank/RefSeq bracketed organism at (or near) end of description
+    m = re.search(r"\[([^\[\]]+)\]\s*$", h)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _extract_protein_name(header: str) -> str:
+    """
+    Best-effort extraction of the protein/product name from a FASTA header.
+
+    Handles:
+      UniProt  ``>sp|P12345|GENE_HUMAN Serine protease OS=Homo sapiens ...``
+               → ``Serine protease``
+      GenBank  ``>NP_000001.1 alpha-1-B glycoprotein precursor [Homo sapiens]``
+               → ``alpha-1-B glycoprotein precursor``
+
+    Returns an empty string when no name can be extracted.
+    """
+    h = header.lstrip(">").strip()
+    # UniProt: accession block ends at first space; name runs until OS=/OX=/GN=/PE=/SV=
+    m = re.match(r"(?:sp|tr)\|[A-Z0-9]+\|\S+\s+(.*?)(?:\s+OS=|\s+OX=|\s+GN=|\s+PE=|\s+SV=|$)", h)
+    if m:
+        return m.group(1).strip()
+    # GenBank/RefSeq: first token is accession, rest is description, remove trailing [Organism]
+    parts = h.split(None, 1)
+    if len(parts) < 2:
+        return ""
+    desc = parts[1].strip()
+    # Remove trailing bracketed organism
+    desc = re.sub(r"\s*\[[^\[\]]+\]\s*$", "", desc)
+    return desc.strip()
+
+
+def _infer_protein_label(
+    path: str,
+    db_protein_names: "dict[str, str] | None" = None,
+) -> str:
+    """
+    Infer a consensus/majority protein name for the sequences in *path*.
+
+    **Priority**: if *db_protein_names* (accession → name from a UniProt /
+    NCBI lookup) is provided and non-empty, the majority name from those
+    database records is used — this is far more reliable than header parsing.
+
+    **Fallback**: parse FASTA headers for protein descriptions.
+
+    Returns the file stem if nothing can be determined.
+    """
+    # ── Attempt 1: database-fetched protein names (most authoritative) ────
+    if db_protein_names:
+        counts: "dict[str, int]" = {}
+        for name in db_protein_names.values():
+            key = name.rstrip(".,; ")
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+        if counts:
+            best = max(counts, key=counts.get)   # type: ignore[arg-type]
+            total = sum(counts.values())
+            if counts[best] / total <= 0.5:
+                return f"{best} (+{len(counts) - 1} others)"
+            return best
+
+    # ── Attempt 2: parse FASTA headers ────────────────────────────────────
+    counts2: "dict[str, int]" = {}
+    with open(path) as fh:
+        for raw in fh:
+            if raw.startswith(">"):
+                name = _extract_protein_name(raw)
+                if name:
+                    key = name.rstrip(".,; ")
+                    counts2[key] = counts2.get(key, 0) + 1
+    if counts2:
+        best = max(counts2, key=counts2.get)     # type: ignore[arg-type]
+        total = sum(counts2.values())
+        if counts2[best] < total and counts2[best] / total < 0.5:
+            return f"{best} (+{len(counts2) - 1} others)"
+        return best
+
+    return pathlib.Path(path).stem
+
+
+def parse_fasta(path: str) -> list[tuple[str, str, str, str]]:
     """
     Parse a FASTA file.
 
-    Returns list of (accession, db_type, sequence) tuples.
+    Returns list of ``(accession, db_type, sequence, org_hint)`` tuples.
+    *org_hint* is the organism name extracted from the header line (empty
+    string when not present).
     Sequences are uppercased; ambiguous/gap characters are preserved.
     """
     records = []
-    acc = db = None
+    acc = db = org = None
     buf: list[str] = []
 
     with open(path) as fh:
@@ -102,16 +207,137 @@ def parse_fasta(path: str) -> list[tuple[str, str, str]]:
                 continue
             if line.startswith(">"):
                 if acc is not None:
-                    records.append((acc, db, "".join(buf).upper()))
+                    records.append((acc, db, "".join(buf).upper(), org))
                 acc, db = parse_identifier(line)
+                org = _extract_org_hint(line)
                 buf = []
             else:
                 buf.append(line)
 
     if acc is not None:
-        records.append((acc, db, "".join(buf).upper()))
+        records.append((acc, db, "".join(buf).upper(), org))
 
     return records
+
+
+# ---------------------------------------------------------------------------
+# Additional alignment format parsers  (Stockholm, Clustal, NEXUS)
+# ---------------------------------------------------------------------------
+
+def detect_format(path: str) -> str:
+    """Auto-detect alignment format from the first non-blank line."""
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("# STOCKHOLM"):
+                return "stockholm"
+            if line.startswith("CLUSTAL"):
+                return "clustal"
+            if line.upper().startswith("#NEXUS"):
+                return "nexus"
+            return "fasta"
+    return "fasta"
+
+
+def parse_stockholm(path: str) -> list[tuple[str, str, str, str]]:
+    """Parse a Stockholm (.sto/.sth) alignment file."""
+    seqs: dict[str, list[str]] = {}
+    order: list[str] = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line.startswith("#") or line.startswith("//") or not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) == 2:
+                name, seq = parts
+                if name not in seqs:
+                    order.append(name)
+                    seqs[name] = []
+                seqs[name].append(seq)
+    records: list[tuple[str, str, str, str]] = []
+    for name in order:
+        full_seq = "".join(seqs[name]).upper()
+        acc, db = parse_identifier(">" + name)
+        org = _extract_org_hint(">" + name)
+        records.append((acc, db, full_seq, org))
+    return records
+
+
+def parse_clustal(path: str) -> list[tuple[str, str, str, str]]:
+    """Parse a Clustal (.aln) alignment file."""
+    seqs: dict[str, list[str]] = {}
+    order: list[str] = []
+    with open(path) as fh:
+        for i, line in enumerate(fh):
+            line = line.rstrip()
+            if i == 0 and line.startswith("CLUSTAL"):
+                continue
+            if not line.strip() or line[0] == " ":
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                name, seq = parts[0], parts[1]
+                if name not in seqs:
+                    order.append(name)
+                    seqs[name] = []
+                seqs[name].append(seq)
+    records: list[tuple[str, str, str, str]] = []
+    for name in order:
+        full_seq = "".join(seqs[name]).upper()
+        acc, db = parse_identifier(">" + name)
+        org = _extract_org_hint(">" + name)
+        records.append((acc, db, full_seq, org))
+    return records
+
+
+def parse_nexus(path: str) -> list[tuple[str, str, str, str]]:
+    """Parse a NEXUS (.nex/.nexus) alignment file."""
+    seqs: dict[str, list[str]] = {}
+    order: list[str] = []
+    in_matrix = False
+    with open(path) as fh:
+        for line in fh:
+            stripped = line.strip()
+            low = stripped.lower()
+            if low == "matrix":
+                in_matrix = True
+                continue
+            if in_matrix:
+                if stripped == ";" or low.startswith("end"):
+                    in_matrix = False
+                    continue
+                parts = stripped.split()
+                if len(parts) >= 2:
+                    name, seq = parts[0], parts[1]
+                    if name not in seqs:
+                        order.append(name)
+                        seqs[name] = []
+                    seqs[name].append(seq)
+    records: list[tuple[str, str, str, str]] = []
+    for name in order:
+        full_seq = "".join(seqs[name]).upper()
+        acc, db = parse_identifier(">" + name)
+        org = _extract_org_hint(">" + name)
+        records.append((acc, db, full_seq, org))
+    return records
+
+
+def parse_alignment(path: str) -> list[tuple[str, str, str, str]]:
+    """Auto-detect format and parse an alignment file.
+
+    Supported formats: FASTA, Stockholm, Clustal, NEXUS.
+    """
+    fmt = detect_format(path)
+    if fmt == "stockholm":
+        return parse_stockholm(path)
+    if fmt == "clustal":
+        return parse_clustal(path)
+    if fmt == "nexus":
+        return parse_nexus(path)
+    return parse_fasta(path)
 
 
 # ---------------------------------------------------------------------------
@@ -179,8 +405,9 @@ class TaxCache:
 
     def __init__(self, path: str) -> None:
         self._path  = pathlib.Path(path).expanduser()
-        self._taxids:   dict[str, int]     = {}
-        self._taxonomy: dict[int, TaxInfo] = {}
+        self._taxids:       dict[str, int]     = {}
+        self._taxonomy:     dict[int, TaxInfo] = {}
+        self._protein_names: dict[str, str]    = {}   # accession → protein name
         self._dirty = False
         self._load()
 
@@ -227,20 +454,23 @@ class TaxCache:
                 int(k): self._dict_to_info(v)
                 for k, v in data.get("taxonomy", {}).items()
             }
-        except Exception:
-            pass                # corrupt / unreadable – start fresh silently
+            self._protein_names = dict(data.get("protein_names", {}))
+        except Exception as exc:
+            print(f"  Warning: cache file {self._path} could not be read "
+                  f"({exc}); starting with empty cache.", file=sys.stderr)
 
     def save(self) -> None:
         """Flush new entries to disk; no-op when nothing changed."""
         if not self._dirty:
             return
         payload = {
-            "version":  _CACHE_VERSION,
-            "taxids":   self._taxids,
+            "version":       _CACHE_VERSION,
+            "taxids":        self._taxids,
             "taxonomy": {
                 str(k): self._info_to_dict(v)
                 for k, v in self._taxonomy.items()
             },
+            "protein_names": self._protein_names,
         }
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -271,6 +501,15 @@ class TaxCache:
     def set_taxonomy(self, taxid: int, info: TaxInfo) -> None:
         if taxid not in self._taxonomy:
             self._taxonomy[taxid] = info
+            self._dirty = True
+
+    def get_protein_name(self, accession: str) -> str:
+        """Return the cached protein name for *accession* (empty if absent)."""
+        return self._protein_names.get(accession, "")
+
+    def set_protein_name(self, accession: str, name: str) -> None:
+        if name and self._protein_names.get(accession) != name:
+            self._protein_names[accession] = name
             self._dirty = True
 
     def stats(self) -> tuple[int, int]:
@@ -324,7 +563,7 @@ def _taxonomy_from_ncbi(taxid: int, api_key: str | None = None) -> TaxInfo | Non
     if lineage_ex is not None:
         for node in lineage_ex.findall("Taxon"):
             lineage.append(TaxNode(
-                taxon_id=int(node.findtext("TaxId", "0")),
+                taxon_id=int(node.findtext("TaxId") or "0"),
                 name=node.findtext("ScientificName", "").strip(),
                 rank=node.findtext("Rank", "no rank").strip().lower(),
             ))
@@ -333,25 +572,42 @@ def _taxonomy_from_ncbi(taxid: int, api_key: str | None = None) -> TaxInfo | Non
     return TaxInfo(taxon_id=taxid, scientific_name=sci_name, lineage=lineage)
 
 
-def _taxid_from_uniprot(accession: str) -> int | None:
+def _taxid_from_uniprot(accession: str) -> "tuple[int | None, str]":
     """
     Look up the NCBI taxon ID for a UniProt accession via the UniProt REST API.
+
+    Returns ``(taxid, protein_name)`` where *protein_name* is the
+    recommended or submitted full protein name (empty string if unavailable).
     """
     url = f"{UNIPROT_BASE}/{accession}.json"
     try:
         body = _http_get(url)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            return None
+            return None, ""
         raise
     data = json.loads(body)
-    return data.get("organism", {}).get("taxonId")
+    taxid = data.get("organism", {}).get("taxonId")
+    # Extract protein name from the response
+    prot_name = ""
+    pdesc = data.get("proteinDescription", {})
+    rec = pdesc.get("recommendedName")
+    if rec:
+        prot_name = rec.get("fullName", {}).get("value", "")
+    if not prot_name:
+        sub = pdesc.get("submissionNames", [])
+        if sub:
+            prot_name = sub[0].get("fullName", {}).get("value", "")
+    return taxid, prot_name
 
 
-def _taxid_from_ncbi_protein(accession: str, api_key: str | None = None) -> int | None:
+def _taxid_from_ncbi_protein(accession: str, api_key: str | None = None) -> "tuple[int | None, str]":
     """
     Look up the NCBI taxon ID for a GenBank/RefSeq protein accession.
     Parses the taxon:XXXXXX qualifier from the GenPept source feature.
+
+    Returns ``(taxid, protein_name)`` where *protein_name* is the
+    ``<GBSeq_definition>`` text (empty string if unavailable).
     """
     url = (f"{NCBI_BASE}/efetch.fcgi?db=protein&id={accession}"
            f"&rettype=gp&retmode=xml"
@@ -360,24 +616,33 @@ def _taxid_from_ncbi_protein(accession: str, api_key: str | None = None) -> int 
     try:
         body = _http_get(url)
     except Exception:
-        return None
+        return None, ""
 
     try:
         root = ET.fromstring(body)
     except ET.ParseError:
-        return None
+        return None, ""
 
+    # Extract protein name from <GBSeq_definition>
+    prot_name = ""
+    defn = root.findtext(".//GBSeq_definition")
+    if defn:
+        # Strip trailing "[Organism name]" bracket
+        prot_name = re.sub(r"\s*\[[^\[\]]+\]\s*$", "", defn).strip()
+
+    taxid = None
     for qual in root.iter("GBQualifier"):
         if qual.findtext("GBQualifier_name") == "db_xref":
             val = qual.findtext("GBQualifier_value", "")
             if val.startswith("taxon:"):
-                return int(val.split(":")[1])
-    return None
+                taxid = int(val.split(":")[1])
+                break
+    return taxid, prot_name
 
 
 def fetch_taxonomy(accession: str, db_type: str,
                    api_key: str | None = None,
-                   cache: TaxCache | None = None) -> tuple[TaxInfo | None, bool]:
+                   cache: "TaxCache | None" = None) -> "tuple[TaxInfo | None, bool, str]":
     """
     Fetch full taxonomy for one protein accession.
 
@@ -388,48 +653,56 @@ def fetch_taxonomy(accession: str, db_type: str,
 
     Both the accession→taxid mapping and the taxid→TaxInfo record are
     checked in *cache* before making any network request, and stored there
-    after a successful fetch.
+    after a successful fetch.  The protein name obtained from the same API
+    call is cached separately for column labelling in focus-group output.
 
-    Returns (TaxInfo | None, from_cache: bool).
+    Returns ``(TaxInfo | None, from_cache: bool, protein_name: str)``.
     """
     try:
         # ── Step 1: resolve accession → taxon ID ──────────────────────────
-        taxid: int | None = cache.get_taxid(accession) if cache else None
+        taxid: "int | None" = cache.get_taxid(accession) if cache else None
         taxid_from_cache  = taxid is not None
+
+        prot_name: str = ""
+        if cache:
+            prot_name = cache.get_protein_name(accession)
 
         if taxid is None:
             if db_type == "uniprot":
-                taxid = _taxid_from_uniprot(accession)
+                taxid, prot_name = _taxid_from_uniprot(accession)
             else:
-                taxid = _taxid_from_ncbi_protein(accession, api_key)
+                taxid, prot_name = _taxid_from_ncbi_protein(accession, api_key)
             if taxid is None:
-                return None, False
+                return None, False, ""
             if cache:
                 cache.set_taxid(accession, taxid)
+                if prot_name:
+                    cache.set_protein_name(accession, prot_name)
 
         # ── Step 2: resolve taxon ID → full lineage ────────────────────────
-        info: TaxInfo | None = cache.get_taxonomy(taxid) if cache else None
+        info: "TaxInfo | None" = cache.get_taxonomy(taxid) if cache else None
         info_from_cache = info is not None
 
         if info is None:
             info = _taxonomy_from_ncbi(taxid, api_key)
             if info is None:
-                return None, False
+                return None, False, ""
             if cache:
                 cache.set_taxonomy(taxid, info)
 
         from_cache = taxid_from_cache and info_from_cache
-        return info, from_cache
+        return info, from_cache, prot_name
 
-    except Exception:
-        return None, False
+    except Exception as exc:
+        _log.debug("fetch_taxonomy(%s): unexpected error: %s", accession, exc)
+        return None, False, ""
 
 
 def fetch_all_taxonomies(
     records: list[tuple[str, str, str]],
     api_key: str | None = None,
-    cache: TaxCache | None = None,
-) -> dict[str, TaxInfo]:
+    cache: "TaxCache | None" = None,
+) -> "tuple[dict[str, TaxInfo], dict[str, str]]":
     """
     Fetch taxonomy for every record in *records*, printing progress.
 
@@ -437,8 +710,11 @@ def fetch_all_taxonomies(
     labelled ``[cached]`` in the progress output.  After all records are
     processed the cache is flushed to disk (if it is dirty).
 
-    Returns a dict mapping accession → TaxInfo.
-    Accessions for which taxonomy cannot be retrieved are omitted.
+    Returns ``(tax_map, protein_names)`` where *tax_map* maps accession →
+    TaxInfo and *protein_names* maps accession → protein/product name
+    obtained from the database lookup (empty string when unavailable).
+    Accessions for which taxonomy cannot be retrieved are omitted from
+    *tax_map*.
     """
     if cache:
         n_acc, n_tax = cache.stats()
@@ -447,11 +723,14 @@ def fetch_all_taxonomies(
                   f"loaded from {cache._path}")
 
     tax_map: dict[str, TaxInfo] = {}
+    prot_names: dict[str, str] = {}
     n = len(records)
     n_hits = 0
-    for idx, (acc, db, _seq) in enumerate(records, 1):
+    for idx, (acc, db, *_rest) in enumerate(records, 1):
         print(f"  [{idx}/{n}] {acc} ({db})… ", end="", flush=True)
-        info, from_cache = fetch_taxonomy(acc, db, api_key, cache)
+        info, from_cache, prot_name = fetch_taxonomy(acc, db, api_key, cache)
+        if prot_name:
+            prot_names[acc] = prot_name
         if info is None:
             print("not found – skipped")
         else:
@@ -467,7 +746,7 @@ def fetch_all_taxonomies(
             print(f"  {n_hits}/{n} record(s) served from cache "
                   f"(no network call needed).")
 
-    return tax_map
+    return tax_map, prot_names
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +780,7 @@ def rank_conservation(
     sim_mat: list[list[float]],
     tax_map: dict[str, TaxInfo],
     rank: str,
+    n_bootstrap: int = 0,
 ) -> dict:
     """
     Compute median pairwise similarity within and between taxa at *rank*.
@@ -538,13 +818,95 @@ def rank_conservation(
     all_intra = [s for g in group_data.values() for s, *_ in g["intra_pairs"]]
     all_inter = [s for s, *_ in inter_pairs]
 
-    return {
+    result = {
         "rank":         rank,
         "groups":       group_data,
         "inter_pairs":  inter_pairs,
         "intra_median": statistics.median(all_intra) if all_intra else None,
         "inter_median": statistics.median(all_inter) if all_inter else None,
+        "all_intra":    all_intra,
+        "all_inter":    all_inter,
+        "intra_ci":     None,
+        "inter_ci":     None,
     }
+
+    if n_bootstrap > 0:
+        if all_intra:
+            result["intra_ci"] = bootstrap_ci(all_intra, n_bootstrap)
+        if all_inter:
+            result["inter_ci"] = bootstrap_ci(all_inter, n_bootstrap)
+
+    return result
+
+
+def bootstrap_ci(
+    values: list[float],
+    n_bootstrap: int = 1000,
+    ci: float = 0.95,
+    seed: "int | None" = None,
+) -> "tuple[float, float]":
+    """
+    Percentile bootstrap 95% confidence interval for the median.
+
+    Returns ``(lower, upper)``.
+    """
+    import random
+    if not values or n_bootstrap < 1:
+        return (float("nan"), float("nan"))
+    rng = random.Random(seed)
+    n = len(values)
+    medians: list[float] = []
+    for _ in range(n_bootstrap):
+        sample = [values[rng.randint(0, n - 1)] for _ in range(n)]
+        medians.append(statistics.median(sample))
+    medians.sort()
+    alpha = (1.0 - ci) / 2.0
+    lo_idx = max(0, int(math.floor(alpha * len(medians))))
+    hi_idx = min(len(medians) - 1, int(math.floor((1.0 - alpha) * len(medians))))
+    return (medians[lo_idx], medians[hi_idx])
+
+
+def group_sim_matrix(rank_result: dict):
+    """Build a group-level similarity matrix from a rank_conservation result.
+
+    Diagonal  = per-group intra_median (1.0 when the group has only one member).
+    Off-diag  = median of all pairwise similarities between the two groups.
+
+    Returns ``(group_names, sim_matrix)`` where *sim_matrix* is a
+    ``list[list[float]]`` of size N×N (N = number of groups), suitable for
+    passing directly to ``plot_dendrogram`` or ``export_phyloxml``.
+    """
+    groups      = rank_result["groups"]
+    inter_pairs = rank_result["inter_pairs"]   # (sim, ta, tb, id1, id2)
+
+    group_names = sorted(groups.keys())
+    n    = len(group_names)
+    gidx = {name: i for i, name in enumerate(group_names)}
+
+    # Collect inter-group pairwise sims grouped by taxon pair
+    pair_sims: dict = {}
+    for sim, ta, tb, _id1, _id2 in inter_pairs:
+        key = (ta, tb) if ta <= tb else (tb, ta)
+        if key not in pair_sims:
+            pair_sims[key] = []
+        pair_sims[key].append(sim)
+
+    mat = [[0.0] * n for _ in range(n)]
+
+    # Diagonal: intra-group median (1.0 for singletons)
+    for name, gdata in groups.items():
+        i   = gidx[name]
+        med = gdata["intra_median"]
+        mat[i][i] = med if med is not None else 1.0
+
+    # Off-diagonal: per-pair inter-group median
+    for (ta, tb), sims in pair_sims.items():
+        i, j = gidx[ta], gidx[tb]
+        med  = statistics.median(sims) if sims else 0.0
+        mat[i][j] = med
+        mat[j][i] = med
+
+    return group_names, mat
 
 
 def permutation_test_rank(
@@ -663,7 +1025,8 @@ def permutation_test_rank(
 
 def print_rank_conservation(result: dict, ids: list[str],
                              tax_map: dict[str, TaxInfo],
-                             perm_result: "dict | None" = None) -> None:
+                             perm_result: "dict | None" = None,
+                             display_ids: "list[str] | None" = None) -> None:
     rank = result["rank"]
     groups = result["groups"]
 
@@ -671,16 +1034,18 @@ def print_rank_conservation(result: dict, ids: list[str],
     print("=" * 60)
 
     # Sequence → taxon mapping table
+    # ids are raw accessions (tax_map keys); display_ids are the labelled forms
+    _disp = display_ids if display_ids is not None else ids
     print(f"\n  {'Accession':<20} {'Organism':<30} {rank.capitalize()}")
     print(f"  {'-'*20} {'-'*30} {'-'*20}")
-    for acc in ids:
-        info = tax_map.get(acc)
+    for raw_acc, disp_acc in zip(ids, _disp):
+        info = tax_map.get(raw_acc)
         if info is None:
-            print(f"  {acc:<20} {'(no taxonomy)':<30} –")
+            print(f"  {disp_acc:<20} {'(no taxonomy)':<30} –")
             continue
         node = info.at_rank(rank)
         rank_name = node.name if node else f"(no {rank} rank)"
-        print(f"  {acc:<20} {info.scientific_name:<30} {rank_name}")
+        print(f"  {disp_acc:<20} {info.scientific_name:<30} {rank_name}")
 
     # Per-group within-rank median
     print(f"\n  Within-{rank} median similarity")
@@ -711,10 +1076,14 @@ def print_rank_conservation(result: dict, ids: list[str],
     print(f"\n  Overall summary")
     intra_med = result["intra_median"]
     inter_med = result["inter_median"]
+    intra_ci = result.get("intra_ci")
+    inter_ci = result.get("inter_ci")
+    intra_ci_str = f"  95% CI [{intra_ci[0]:.4f}, {intra_ci[1]:.4f}]" if intra_ci else ""
+    inter_ci_str = f"  95% CI [{inter_ci[0]:.4f}, {inter_ci[1]:.4f}]" if inter_ci else ""
     print(f"  Intra-{rank} median:   "
-          f"{intra_med:.4f}" if intra_med is not None else f"  Intra-{rank} median:   n/a")
+          f"{intra_med:.4f}{intra_ci_str}" if intra_med is not None else f"  Intra-{rank} median:   n/a")
     print(f"  Inter-{rank} median:   "
-          f"{inter_med:.4f}" if inter_med is not None else f"  Inter-{rank} median:   n/a")
+          f"{inter_med:.4f}{inter_ci_str}" if inter_med is not None else f"  Inter-{rank} median:   n/a")
     if intra_med is not None and inter_med is not None:
         direction = "higher" if intra_med > inter_med else "lower"
         print(f"  Within-{rank} similarity is {direction} than between-{rank} "
@@ -906,10 +1275,13 @@ def plot_dendrogram(
     sim_mat: list[list[float]],
     path: str,
     method: str = "average",
+    title: "str | None" = None,
 ) -> None:
     """
-    Save a hierarchical-clustering dendrogram of the sequences.
+    Save a hierarchical-clustering dendrogram.
 
+    *ids* may be individual sequence accessions or group (taxon) names when
+    the matrix has been pre-aggregated by ``group_sim_matrix()``.
     Distance = 1 − similarity.  Linkage method is *average* (UPGMA) by
     default; any method accepted by ``scipy.cluster.hierarchy.linkage``
     is valid (single, complete, ward, …).
@@ -968,11 +1340,10 @@ def plot_dendrogram(
     )
 
     ax.set_xlabel("Distance  (1 − similarity)", fontsize=9)
-    ax.set_title(
-        f"Hierarchical clustering  ·  {method} linkage  ·  "
-        f"{n} sequences",
-        fontsize=10, pad=10,
+    plot_title = title if title is not None else (
+        f"Hierarchical clustering  ·  {method} linkage  ·  {n} sequences"
     )
+    ax.set_title(plot_title, fontsize=10, pad=10)
     ax.tick_params(axis="y", labelsize=max(7, min(10, int(110 / n))))
     ax.spines[["top", "right"]].set_visible(False)
 
@@ -1030,18 +1401,23 @@ def export_phyloxml(
 
     # ── recursively build <clade> elements ──────────────────────────────────
     def _clade(node_id: int, parent_height: float) -> ET.Element:
+        # PhyloXML schema order within <clade>: name?, branch_length?, …, clade*
         elem = ET.Element("clade")
         if node_id < n:
-            bl = parent_height          # leaf height is 0
+            # Leaf: name then branch_length (no children)
             ET.SubElement(elem, "name").text = ids[node_id]
+            bl = parent_height      # leaf height is 0
+            if bl > 1e-10:
+                ET.SubElement(elem, "branch_length").text = f"{bl:.8f}"
         else:
+            # Internal node: branch_length first, then child clades
             row    = Z[node_id - n]
             height = float(row[2])
             bl     = parent_height - height
+            if bl > 1e-10:
+                ET.SubElement(elem, "branch_length").text = f"{bl:.8f}"
             elem.append(_clade(int(row[0]), height))
             elem.append(_clade(int(row[1]), height))
-        if bl > 1e-10:
-            ET.SubElement(elem, "branch_length").text = f"{bl:.8f}"
         return elem
 
     root_id     = n + len(Z) - 1
@@ -1079,6 +1455,78 @@ def export_phyloxml(
         fh.write(ET.tostring(phyloxml, encoding="unicode"))
         fh.write("\n")
     print(f"  PhyloXML written to: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Newick tree export
+# ---------------------------------------------------------------------------
+
+def _linkage_to_newick(Z, ids: list[str]) -> str:
+    """Convert a scipy linkage matrix *Z* to a Newick string."""
+    n = len(ids)
+
+    # Characters illegal in Newick leaf labels → replaced with _
+    _BAD = str.maketrans("(),:;[] ", "________")
+
+    def _node(node_id: int, parent_height: float) -> str:
+        if node_id < n:
+            bl = parent_height
+            name = ids[node_id].translate(_BAD)
+            return f"{name}:{bl:.8f}" if bl > 1e-10 else name
+        row = Z[node_id - n]
+        height = float(row[2])
+        bl = parent_height - height
+        left  = _node(int(row[0]), height)
+        right = _node(int(row[1]), height)
+        bl_str = f":{bl:.8f}" if bl > 1e-10 else ""
+        return f"({left},{right}){bl_str}"
+
+    root_id = n + len(Z) - 1
+    root_height = float(Z[-1][2])
+    return _node(root_id, root_height) + ";"
+
+
+def export_newick(
+    ids: list[str],
+    sim_mat: list[list[float]],
+    path: str,
+    method: str = "average",
+) -> None:
+    """
+    Export the hierarchical clustering tree as a Newick string.
+
+    Uses the same distance matrix (1 − similarity) and linkage method as
+    ``plot_dendrogram`` and ``export_phyloxml``.
+    Requires scipy (``pip install scipy``).
+    """
+    try:
+        from scipy.spatial.distance import squareform
+        from scipy.cluster.hierarchy import linkage
+        import numpy as np
+    except ImportError:
+        print(
+            "  Warning: scipy is not installed – Newick export skipped.\n"
+            "  Install it with:  pip install scipy",
+            file=sys.stderr,
+        )
+        return
+
+    n = len(ids)
+    if n < 2:
+        print("  Note: Newick export requires at least 2 sequences – skipped.")
+        return
+
+    dist_sq = np.array([[1.0 - sim_mat[i][j] for j in range(n)]
+                        for i in range(n)], dtype=float)
+    np.fill_diagonal(dist_sq, 0.0)
+    dist_sq = np.clip(dist_sq, 0.0, None)
+    Z = linkage(squareform(dist_sq, checks=False), method=method)
+
+    nwk = _linkage_to_newick(Z, ids)
+    pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(nwk + "\n")
+    print(f"  Newick tree written to: {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1407,9 +1855,8 @@ def henikoff_weights(seqs: list[str]) -> list[float]:
     average weight equals 1.0 — values above 1 flag under-represented
     sequences, values below 1 flag over-represented ones.
     """
-    n    = len(seqs)
-    _GAP = {"-", "."}
-    raw  = [0.0] * n
+    n   = len(seqs)
+    raw = [0.0] * n
 
     for pos in range(len(seqs[0])):
         col_idx = [i for i in range(n) if seqs[i][pos] not in _GAP]
@@ -1449,7 +1896,6 @@ def per_position_conservation(seqs: list[str],
     are weighted equally.
     """
     length = len(seqs[0])
-    _GAP   = {"-", "."}
     w      = weights if weights is not None else [1.0] * len(seqs)
     scores: list[float] = []
 
@@ -1466,7 +1912,7 @@ def per_position_conservation(seqs: list[str],
                 ww    = w[i] * w[j]
                 num  += ww * (1.0 if a == b else 0.0)
                 den  += ww
-            scores.append(num / den if den else 1.0)
+            scores.append(num / den if den else float("nan"))
         else:
             num = den = 0.0
             for i, j in combinations(idx, 2):
@@ -1476,9 +1922,107 @@ def per_position_conservation(seqs: list[str],
                     ww   = w[i] * w[j]
                     num += ww * ns
                     den += ww
-            scores.append(num / den if den else 0.0)
+            scores.append(num / den if den else float("nan"))
 
     return scores
+
+
+# ---------------------------------------------------------------------------
+# Shannon entropy / information content per position
+# ---------------------------------------------------------------------------
+
+_MAX_PROTEIN_ENTROPY = math.log2(20)  # ~4.322 bits
+
+
+def per_position_entropy(seqs: list[str]) -> list[tuple[float, float]]:
+    """
+    Shannon entropy and information content per alignment column.
+
+    Returns a list of ``(entropy_bits, information_content)`` tuples.
+    IC = log₂(20) − H  for protein sequences.  All-gap columns yield
+    (0.0, log₂(20)).  Single-residue columns yield (0.0, log₂(20)).
+    """
+    results: list[tuple[float, float]] = []
+    for pos in range(len(seqs[0])):
+        residues = [seqs[i][pos].upper()
+                    for i in range(len(seqs))
+                    if seqs[i][pos] not in _GAP]
+        if len(residues) < 2:
+            results.append((0.0, _MAX_PROTEIN_ENTROPY))
+            continue
+        counts: dict[str, int] = {}
+        for aa in residues:
+            counts[aa] = counts.get(aa, 0) + 1
+        n = len(residues)
+        entropy = -sum((c / n) * math.log2(c / n) for c in counts.values())
+        ic = _MAX_PROTEIN_ENTROPY - entropy
+        results.append((entropy, ic))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Near-duplicate detection
+# ---------------------------------------------------------------------------
+
+def detect_near_duplicates(
+    ids: list[str],
+    sim_mat: list[list[float]],
+    threshold: float = 0.98,
+) -> list[tuple[str, str, float]]:
+    """
+    Return pairs of sequences whose pairwise similarity ≥ *threshold*.
+
+    Returns a list of ``(id_a, id_b, similarity)`` sorted descending.
+    """
+    dupes: list[tuple[str, str, float]] = []
+    for i, j in combinations(range(len(ids)), 2):
+        if sim_mat[i][j] >= threshold:
+            dupes.append((ids[i], ids[j], sim_mat[i][j]))
+    dupes.sort(key=lambda x: x[2], reverse=True)
+    return dupes
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight QC
+# ---------------------------------------------------------------------------
+
+def preflight_qc(records: list) -> dict:
+    """Compute quality-control statistics for a set of parsed records."""
+    seqs    = [r[2] for r in records]
+    lengths = [len(s) for s in seqs]
+    _AMBIG  = set("XBZJ")
+
+    total_chars = sum(lengths)
+    total_gaps  = sum(1 for s in seqs for c in s if c in _GAP)
+    total_ambig = sum(1 for s in seqs for c in s.upper() if c in _AMBIG)
+
+    return {
+        "n_sequences":       len(records),
+        "length_min":        min(lengths) if lengths else 0,
+        "length_max":        max(lengths) if lengths else 0,
+        "length_mean":       sum(lengths) / len(lengths) if lengths else 0.0,
+        "length_median":     statistics.median(lengths) if lengths else 0.0,
+        "total_residues":    total_chars,
+        "gap_count":         total_gaps,
+        "gap_fraction":      total_gaps / total_chars if total_chars else 0.0,
+        "ambiguous_count":   total_ambig,
+        "ambiguous_fraction": total_ambig / total_chars if total_chars else 0.0,
+    }
+
+
+def print_preflight_qc(qc: dict) -> None:
+    """Pretty-print the pre-flight QC summary."""
+    print("\nInput Quality Summary")
+    print("=" * 50)
+    print(f"  Sequences:           {qc['n_sequences']}")
+    print(f"  Length range:        {qc['length_min']}\u2013{qc['length_max']} aa")
+    print(f"  Length mean:         {qc['length_mean']:.1f} aa")
+    print(f"  Length median:       {qc['length_median']:.1f} aa")
+    print(f"  Total residues:      {qc['total_residues']:,}")
+    print(f"  Gap characters:      {qc['gap_count']:,} "
+          f"({qc['gap_fraction']:.1%})")
+    print(f"  Ambiguous (X/B/Z/J): {qc['ambiguous_count']:,} "
+          f"({qc['ambiguous_fraction']:.1%})")
 
 
 # ---------------------------------------------------------------------------
@@ -1489,12 +2033,13 @@ def _col(text: str, width: int, right: bool = False) -> str:
     return f"{text:>{width}}" if right else f"{text:<{width}}"
 
 
-def print_sequence_table(records: list[tuple[str, str, str]]) -> None:
+def print_sequence_table(records: list) -> None:
     print("\nInput sequences")
     print("=" * 50)
     print(f"{'Accession':<20} {'Database':<12} {'Length':>8}")
     print("-" * 42)
-    for acc, db, seq in records:
+    for r in records:
+        acc, db, seq = r[0], r[1], r[2]
         print(f"{acc:<20} {db:<12} {len(seq):>8}")
 
 
@@ -1562,9 +2107,10 @@ def print_pairwise_summary(ids: list[str], seqs: list[str],
 
 
 def print_position_summary(scores: list[float], seqs: list[str], top_n: int) -> None:
-    fully = sum(1 for s in scores if s >= 1.0)
-    variable = sum(1 for s in scores if s < 1.0)
-    mean = sum(scores) / len(scores)
+    valid = [s for s in scores if not math.isnan(s)]
+    fully    = sum(1 for s in valid if s >= 1.0)
+    variable = sum(1 for s in valid if s < 1.0)
+    mean     = sum(valid) / len(valid) if valid else 0.0
 
     print("\nPer-position conservation summary")
     print("=" * 50)
@@ -1601,8 +2147,18 @@ def _guard(path: "str | pathlib.Path", overwrite: bool) -> None:
         )
 
 
-def write_matrix_csv(path: str, ids: list[str], mat: list[list[float]]) -> None:
+def _metadata_comment_lines(metadata: "dict | None") -> str:
+    """Format *metadata* as ``# key: value`` comment lines for CSV/TSV files."""
+    if not metadata:
+        return ""
+    return "".join(f"# {k}: {v}\n" for k, v in metadata.items())
+
+
+def write_matrix_csv(path: str, ids: list[str], mat: list[list[float]],
+                     metadata: "dict | None" = None) -> None:
     with open(path, "w", newline="") as fh:
+        if metadata:
+            fh.write(_metadata_comment_lines(metadata))
         writer = csv.writer(fh)
         writer.writerow([""] + ids)
         for i, row_id in enumerate(ids):
@@ -1610,12 +2166,25 @@ def write_matrix_csv(path: str, ids: list[str], mat: list[list[float]]) -> None:
     print(f"  Matrix written to: {path}")
 
 
-def write_conservation_csv(path: str, scores: list[float]) -> None:
+def write_conservation_csv(path: str, scores: list[float],
+                           entropy: "list[tuple[float, float]] | None" = None,
+                           metadata: "dict | None" = None) -> None:
     with open(path, "w", newline="") as fh:
+        if metadata:
+            fh.write(_metadata_comment_lines(metadata))
         writer = csv.writer(fh)
-        writer.writerow(["position", "conservation"])
-        for i, s in enumerate(scores, 1):
-            writer.writerow([i, f"{s:.6f}"])
+        if entropy:
+            writer.writerow(["position", "conservation", "entropy", "information_content"])
+            for i, s in enumerate(scores):
+                e, ic = entropy[i]
+                s_str  = "" if math.isnan(s)  else f"{s:.6f}"
+                e_str  = "" if math.isnan(e)  else f"{e:.6f}"
+                ic_str = "" if math.isnan(ic) else f"{ic:.6f}"
+                writer.writerow([i + 1, s_str, e_str, ic_str])
+        else:
+            writer.writerow(["position", "conservation"])
+            for i, s in enumerate(scores):
+                writer.writerow([i + 1, "" if math.isnan(s) else f"{s:.6f}"])
     print(f"  Per-position conservation written to: {path}")
 
 
@@ -1624,6 +2193,9 @@ def write_conservation_csv(path: str, scores: list[float]) -> None:
 # ---------------------------------------------------------------------------
 
 _FASTA_EXTS = frozenset({".fasta", ".fa", ".faa", ".fna", ".fas"})
+_INPUT_EXTS = frozenset(
+    _FASTA_EXTS | {".sto", ".sth", ".aln", ".nex", ".nexus"}
+)
 
 
 def expand_input_paths(
@@ -1633,7 +2205,7 @@ def expand_input_paths(
     Expand a mixed list of file paths and directory paths to a deduplicated,
     sorted list of FASTA file Paths.
 
-    Directories are scanned for files whose extension is in _FASTA_EXTS.
+    Directories are scanned for files whose extension is in _INPUT_EXTS.
     With *recursive=True* the scan descends into sub-directories.
     Unrecognised paths are skipped with a warning.
     """
@@ -1643,14 +2215,14 @@ def expand_input_paths(
         if p.is_dir():
             pat = "**/*" if recursive else "*"
             hits = sorted(
-                h for ext in _FASTA_EXTS
+                h for ext in _INPUT_EXTS
                 for h in p.glob(f"{pat}{ext}")
                 if h.is_file()
             )
             if not hits:
                 print(
-                    f"  Warning: directory '{raw}' contains no FASTA files "
-                    f"({', '.join(_FASTA_EXTS)}).",
+                    f"  Warning: directory '{raw}' contains no input files "
+                    f"({', '.join(sorted(_INPUT_EXTS))}).",
                     file=sys.stderr,
                 )
             found.extend(hits)
@@ -1743,7 +2315,7 @@ def _resolve_heatmap_path(
     _IMG_EXTS = frozenset({".png", ".pdf", ".svg", ".eps", ".jpg", ".jpeg"})
 
     if flag_val == "":
-        return default_base / f"{stem}_heatmap.png"
+        return default_base / f"{stem}_heatmap.pdf"
 
     p = pathlib.Path(flag_val)
 
@@ -1752,12 +2324,12 @@ def _resolve_heatmap_path(
             # Treat the suffix as the desired format, auto-name the stem
             return default_base / f"{stem}_heatmap{p.suffix}"
         if p.is_dir() or not p.suffix:
-            return p / f"{stem}_heatmap.png"
+            return p / f"{stem}_heatmap.pdf"
         print(
             f"  Note: '{flag_val}' treated as output directory for heatmaps.",
             file=sys.stderr,
         )
-        return p / f"{stem}_heatmap.png"
+        return p / f"{stem}_heatmap.pdf"
 
     return p
 
@@ -1792,12 +2364,278 @@ def _resolve_dendrogram_path(
 
 
 # ---------------------------------------------------------------------------
+# Logging & timing
+# ---------------------------------------------------------------------------
+
+def setup_logging(
+    verbose: bool = False, log_file: "str | None" = None,
+) -> logging.Logger:
+    """Configure a named logger for the tool."""
+    logger = logging.getLogger("prot_ction")
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S"
+    )
+    if not logger.handlers:
+        sh = logging.StreamHandler(sys.stderr)
+        sh.setLevel(logging.DEBUG if verbose else logging.WARNING)
+        sh.setFormatter(fmt)
+        logger.addHandler(sh)
+    if log_file:
+        fh = logging.FileHandler(log_file, mode="w")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    return logger
+
+
+class PhaseTimer:
+    """Simple wall-clock timer for tracking named analysis phases."""
+
+    def __init__(self) -> None:
+        self._phases: list[tuple[str, float]] = []
+        self._start: float = time.time()
+        self._current: "tuple[str, float] | None" = None
+
+    def start(self, name: str) -> None:
+        self.end()
+        self._current = (name, time.time())
+
+    def end(self) -> None:
+        if self._current:
+            name, t0 = self._current
+            self._phases.append((name, time.time() - t0))
+            self._current = None
+
+    def summary(self) -> str:
+        self.end()
+        total = time.time() - self._start
+        lines = [f"  {'Phase':<25} {'Time':>8}"]
+        lines.append(f"  {'-' * 25} {'-' * 8}")
+        for name, dt in self._phases:
+            lines.append(f"  {name:<25} {dt:>7.2f}s")
+        lines.append(f"  {'TOTAL':<25} {total:>7.2f}s")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility metadata
+# ---------------------------------------------------------------------------
+
+def _build_metadata(
+    args: argparse.Namespace, fasta_path: pathlib.Path
+) -> dict:
+    """Build a reproducibility metadata dict for *fasta_path*."""
+    import datetime
+
+    sha = hashlib.sha256()
+    with open(fasta_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            sha.update(chunk)
+    return {
+        "version":        VERSION,
+        "timestamp":      datetime.datetime.now().isoformat(timespec="seconds"),
+        "python_version": sys.version.split()[0],
+        "command":        " ".join(sys.argv),
+        "input_file":     str(fasta_path),
+        "input_sha256":   sha.hexdigest(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Built-in example dataset
+# ---------------------------------------------------------------------------
+
+_EXAMPLE_FASTA = """\
+>sp|P69905|HBA_HUMAN Hemoglobin subunit alpha OS=Homo sapiens OX=9606
+MVLSPADKTNVKAAWGKVGAHAGEYGAEALERMFLSFPTTKTYFPHFDLSH
+GSAQVKGHGKKVADALTNAVAHVDDMPNALSALSDLHAHKLRVDPVNFKLL
+SHCLLVTLAAHLPAEFTPAVHASLDKFLASVSTVLTSKYR
+>sp|P01942|HBA_MOUSE Hemoglobin subunit alpha OS=Mus musculus OX=10090
+MVLSGEDKSNIKAAWGKIGGHGAEYGAEALERMFASFPTTKTYFPHFDVSH
+GSAQVKAHGKKVADALTLAVGHVEDMPAALSDLHAHKLRVDPVNFKLLSHC
+LLVTLANHHPSEFTPAVHASLDKFLASVSTVLTSKYR
+>sp|P01958|HBA_CHICK Hemoglobin subunit alpha OS=Gallus gallus OX=9031
+MVLSAADKNNVKGIFTKIAGHAEEYGAETLERMFTTYPPTKTYFPHFDLSH
+GSAQIKAHGKKVADALTNAVAHVDDMPNALSALSDLHAHKLRVDPVNFKLL
+SHCLLVTLASHHPADFTPAVHASLDKFLANVSTVLTSKYR
+>sp|P02062|HBB_HUMAN Hemoglobin subunit beta OS=Homo sapiens OX=9606
+MVHLTPEEKSAVTALWGKVNVDEVGGEALGRLLVVYPWTQRFFESFGDLST
+PDAVMGNPKVKAHGKKVLGAFSDGLAHLDNLKGTFATLSELHCDKLHVDPE
+NFRLLGNVLVCVLAHHFGKEFTPPVQAAYQKVVAGVANALAHKYH
+>sp|P02088|HBB1_MOUSE Hemoglobin subunit beta-1 OS=Mus musculus OX=10090
+MVHLTDAEKSAVSCLWAKVNPDEVGGEALGRLLVVYPWTQRYFDSFGDLSS
+ASAIMGNPKVKAHGKKVITAFNDGLNHLDSLKGTFASLSELHCDKLHVDPE
+NFKLLGNMIVIVLGHHLGKDFTPAAQAAFQKVVAGVATALAHKYH
+"""
+
+
+def _write_example_fasta() -> str:
+    """Write the built-in example dataset to a temp file and return the path."""
+    fd, path = tempfile.mkstemp(suffix=".fasta", prefix="prot_ction_example_")
+    with open(fd, "w") as fh:
+        fh.write(_EXAMPLE_FASTA)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Violin / box plot for intra vs inter similarity distributions
+# ---------------------------------------------------------------------------
+
+def plot_violin(
+    rank_result: dict,
+    path: "str | None" = None,
+) -> "str | None":
+    """
+    Violin plot of intra-group vs inter-group similarity distributions.
+
+    Saves to *path* when given.  Always returns a base64-encoded PNG
+    string (or None when matplotlib is not available).
+    """
+    try:
+        import base64, io
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        if path:
+            print("  Warning: matplotlib not installed \u2013 violin plot skipped.",
+                  file=sys.stderr)
+        return None
+
+    groups    = rank_result["groups"]
+    all_intra = rank_result.get("all_intra") or [
+        s for g in groups.values() for s, *_ in g["intra_pairs"]
+    ]
+    all_inter = rank_result.get("all_inter") or [
+        s for s, *_ in rank_result["inter_pairs"]
+    ]
+
+    if not all_intra and not all_inter:
+        return None
+
+    rank   = rank_result.get("rank", "group")
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+
+    data, labels, colors = [], [], []
+    if all_intra:
+        data.append(all_intra)
+        labels.append(f"Within-{rank}\n(n={len(all_intra)})")
+        colors.append("#2ecc71")
+    if all_inter:
+        data.append(all_inter)
+        labels.append(f"Between-{rank}\n(n={len(all_inter)})")
+        colors.append("#e74c3c")
+
+    # Draw untrimmed violins: extend KDE beyond data range (like seaborn cut=2)
+    try:
+        from scipy.stats import gaussian_kde
+        import numpy as np
+        _has_scipy = True
+    except ImportError:
+        _has_scipy = False
+
+    if _has_scipy:
+        for i, d in enumerate(data):
+            arr = np.array(d, dtype=float)
+            if len(arr) < 2:
+                continue
+            kde = gaussian_kde(arr)
+            bw  = kde.scotts_factor() * arr.std(ddof=1)
+            lo  = max(arr.min() - 2 * bw, 0.0)
+            hi  = min(arr.max() + 2 * bw, 1.0)
+            ys  = np.linspace(lo, hi, 300)
+            density = kde(ys)
+            density = density / density.max() * 0.4   # scale width
+            pos = i + 1
+            ax.fill_betweenx(ys, pos - density, pos + density,
+                             facecolor=colors[i], alpha=0.6)
+            ax.hlines(np.median(arr), pos - 0.15, pos + 0.15,
+                      color="#222", linewidth=1.5)
+            ax.hlines(np.mean(arr), pos - 0.12, pos + 0.12,
+                      color="#666", linewidth=1, linestyle="--")
+            ax.hlines(arr.min(), pos - 0.05, pos + 0.05, color="#444", linewidth=0.8)
+            ax.hlines(arr.max(), pos - 0.05, pos + 0.05, color="#444", linewidth=0.8)
+            ax.vlines(pos, arr.min(), arr.max(), color="#444", linewidth=0.8)
+    else:
+        # Fallback: use matplotlib's built-in (trimmed) violinplot
+        parts = ax.violinplot(data, showmeans=True, showmedians=True,
+                              showextrema=True)
+        for i, pc in enumerate(parts["bodies"]):
+            pc.set_facecolor(colors[i])
+            pc.set_alpha(0.6)
+        parts["cmedians"].set_color("#222")
+        parts["cmeans"].set_color("#666")
+        parts["cmeans"].set_linestyle("--")
+
+    ax.set_xticks(range(1, len(labels) + 1))
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("Pairwise Similarity", fontsize=10)
+    ax.set_title(
+        f"Similarity Distributions by {rank.capitalize()}", fontsize=11
+    )
+    ax.set_ylim(-0.05, 1.1)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+
+    if path:
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"  Violin plot written to: {path}")
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
+    _EXAMPLES = """\
+Examples:
+  # Basic conservation analysis on a single FASTA file
+  prot_ction.py sequences.fasta
+
+  # MSA input, BLOSUM62 scoring, write similarity matrix and conservation scores
+  prot_ction.py seqs.fasta --mode aligned --scoring blosum62 \\
+      --out-matrix matrix.csv --out-conservation conservation.csv
+
+  # Group by family, output heatmap (PDF) and rank TSV
+  prot_ction.py seqs.fasta --rank family --heatmap --out-rank-tsv
+
+  # Group by species, dendrogram from between-group medians, export PhyloXML
+  prot_ction.py seqs.fasta --rank species --dendrogram --out-phyloxml
+
+  # Add organism names to all identifiers
+  prot_ction.py seqs.fasta --rank genus --organism-labels
+
+  # Sequence weighting + permutation test for rank significance
+  prot_ction.py seqs.fasta --rank genus --weights --permutations 1000
+
+  # Batch: process all FASTA files in a directory, write HTML report
+  prot_ction.py input_dir/ --recursive --report report.html --out-dir results/
+
+  # Use NCBI API key for faster taxonomy lookups; cache results for reuse
+  prot_ction.py seqs.fasta --rank order --ncbi-api-key MY_KEY \\
+      --cache-file taxonomy_cache.json
+
+  # Run built-in example dataset for a quick demo
+  prot_ction.py --example
+
+  # Bootstrap CIs on rank medians, violin plot, verbose logging
+  prot_ction.py seqs.fasta --rank genus --bootstrap 1000 --violin \\
+      --verbose --log-file analysis.log
+
+  # Newick tree export
+  prot_ction.py seqs.fasta --out-newick tree.nwk
+"""
     p = argparse.ArgumentParser(
-        description=__doc__,
+        description=f"prot_ction v{VERSION}\n\n{__doc__}",
+        epilog=_EXAMPLES,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
@@ -1805,19 +2643,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # ── input ──────────────────────────────────────────────────────────────
     p.add_argument(
-        "fasta", nargs="+",
+        "fasta", nargs="*",
         metavar="PATH",
         help=(
-            "One or more FASTA files and/or directories to analyse.  "
+            "One or more alignment files and/or directories to analyse.  "
+            "Supported formats: FASTA, Stockholm (.sto/.sth), Clustal (.aln), "
+            "NEXUS (.nex/.nexus) — auto-detected from file header.  "
             "Directories are scanned for files with extensions "
-            + ", ".join(sorted(_FASTA_EXTS)) + ".  "
+            + ", ".join(sorted(_INPUT_EXTS)) + ".  "
             "Multiple paths are processed in sequence and a cross-file "
             "summary is printed at the end."
         ),
     )
     p.add_argument(
+        "--example", action="store_true",
+        help=(
+            "Run analysis on a built-in example dataset (hemoglobin "
+            "alpha and beta subunits) for demo/testing purposes."
+        ),
+    )
+    p.add_argument(
         "--recursive", action="store_true",
-        help="Scan directories recursively for FASTA files.",
+        help="Scan directories recursively for input files.",
     )
     # ── analysis ───────────────────────────────────────────────────────────
     p.add_argument(
@@ -1839,6 +2686,14 @@ def build_parser() -> argparse.ArgumentParser:
             "and are skipped in similarity calculations.  "
             "'unaligned': strip any gap characters first, then always use the "
             "sliding approach regardless of length."
+        ),
+    )
+    p.add_argument(
+        "--dup-threshold", type=float, default=0.98, metavar="FRAC",
+        help=(
+            "Similarity threshold for near-duplicate warnings (default: 0.98).  "
+            "Pairs with pairwise similarity >= this value are flagged.  "
+            "Set to 1.01 to disable."
         ),
     )
     p.add_argument(
@@ -1910,11 +2765,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable the taxonomy cache entirely (always fetch from network).",
     )
     p.add_argument(
+        "--clear-cache", action="store_true",
+        help=(
+            "Delete the taxonomy cache file before running, forcing all taxonomy "
+            "lookups to be fetched fresh from the network.  The program then "
+            "continues normally and rebuilds the cache from scratch."
+        ),
+    )
+    p.add_argument(
         "--heatmap", metavar="FILE", nargs="?", const="",
         help=(
             "Save a similarity heatmap.  Format is inferred from the extension "
-            "(.png, .pdf, .svg, …); defaults to .png when auto-naming.  "
-            "Requires matplotlib.  Omit FILE to auto-name as {stem}_heatmap.png."
+            "(.pdf, .png, .svg, …); defaults to .pdf when auto-naming.  "
+            "Requires matplotlib.  Omit FILE to auto-name as {stem}_heatmap.pdf."
         ),
     )
     p.add_argument(
@@ -1949,10 +2812,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--out-rank-csv", metavar="FILE", nargs="?", const="",
+        "--out-newick", metavar="FILE", nargs="?", const="",
         help=(
-            "Write per-group rank-conservation table to a CSV file.  "
-            "Omit FILE to auto-name as {stem}_rank_{rank}.csv."
+            "Export the hierarchical clustering tree as a Newick string.  "
+            "The same linkage method as --dendrogram-method is used.  "
+            "Requires scipy (pip install scipy).  "
+            "Omit FILE to auto-name as {stem}_dendrogram.nwk."
+        ),
+    )
+    p.add_argument(
+        "--violin", metavar="FILE", nargs="?", const="",
+        help=(
+            "Save a violin plot comparing within-group vs between-group "
+            "similarity distributions.  Requires --rank and matplotlib.  "
+            "Omit FILE to auto-name as {stem}_violin.pdf."
+        ),
+    )
+    p.add_argument(
+        "--out-rank-tsv", metavar="FILE", nargs="?", const="",
+        help=(
+            "Write within-group and between-group median-similarity table to a "
+            "TSV file (columns: comparison_type, group_a, group_b, n_members_a, "
+            "n_members_b, n_pairs, median_similarity).  "
+            "Omit FILE to auto-name as {stem}_rank_{rank}.tsv."
         ),
     )
     p.add_argument(
@@ -1977,11 +2859,51 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--bootstrap", type=int, default=0, metavar="N",
+        help=(
+            "Number of bootstrap resamples for 95%% confidence intervals "
+            "on intra- and inter-group median similarities.  "
+            "Requires --rank.  Typical values: 1000 or 10000.  "
+            "Default: 0 (disabled)."
+        ),
+    )
+    p.add_argument(
+        "--verbose", action="store_true",
+        help="Enable verbose/debug logging output.",
+    )
+    p.add_argument(
+        "--log-file", metavar="FILE",
+        help="Write structured log output (with timing) to FILE.",
+    )
+    p.add_argument(
         "--overwrite", action="store_true",
         help=(
             "Allow output files to be overwritten if they already exist.  "
             "By default the tool skips any output file that is already present "
             "and prints a warning, leaving the existing file untouched."
+        ),
+    )
+    p.add_argument(
+        "--focus-group", metavar="TAXON",
+        help=(
+            "When analysing multiple files with --rank, produce an additional "
+            "cross-file TSV matrix and PDF heatmap showing the median "
+            "similarity between the named taxonomic group and every other "
+            "group (inter-group) as well as its own intra-group median.  "
+            "Rows are taxonomic groups, columns are input files.  "
+            "The taxon name must match the rank level set by --rank "
+            "(e.g. 'Bacillus subtilis' when --rank species)."
+        ),
+    )
+    p.add_argument(
+        "--organism-labels", action="store_true",
+        help=(
+            "Append the organism name to every sequence identifier in all "
+            "output (matrices, dendrograms, text output, HTML report), "
+            "formatted as accession|Organism_name with spaces replaced by "
+            "underscores.  The name is taken from the NCBI taxonomy record "
+            "when --rank is also given, otherwise extracted from the FASTA "
+            "header (UniProt OS= field or GenBank bracketed name)."
         ),
     )
     p.add_argument(
@@ -2000,24 +2922,660 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _write_rank_csv(path: pathlib.Path, result: dict) -> None:
-    rank   = result["rank"]
-    groups = result["groups"]
+def _write_rank_tsv(path: pathlib.Path, result: dict,
+                    metadata: "dict | None" = None) -> None:
+    """Write within-group (intra) and between-group (inter) median similarities to TSV.
+
+    Columns: comparison_type, group_a, group_b, n_members_a, n_members_b,
+             n_pairs, median_similarity
+    Intra rows have group_a == group_b.  Inter rows list every unique taxon
+    pair sorted alphabetically so group_a <= group_b.
+    """
+    groups      = result["groups"]
+    inter_pairs = result["inter_pairs"]   # (sim, ta, tb, id1, id2)
+
     rows: list[dict] = []
+
+    # ── within-group rows ────────────────────────────────────────────────────
     for taxon, gdata in sorted(groups.items()):
         med = gdata["intra_median"]
+        n   = len(gdata["members"])
         rows.append({
-            rank: taxon,
-            "members": len(gdata["members"]),
-            "intra_pairs": len(gdata["intra_pairs"]),
-            "intra_median_similarity": f"{med:.6f}" if med is not None else "",
+            "comparison_type":   "intra",
+            "group_a":           taxon,
+            "group_b":           taxon,
+            "n_members_a":       n,
+            "n_members_b":       n,
+            "n_pairs":           len(gdata["intra_pairs"]),
+            "median_similarity": f"{med:.6f}" if med is not None else "",
         })
+
+    # ── between-group rows (grouped by taxon pair) ───────────────────────────
+    pair_sims: dict = {}
+    for sim, ta, tb, _id1, _id2 in inter_pairs:
+        key = (ta, tb) if ta <= tb else (tb, ta)
+        if key not in pair_sims:
+            pair_sims[key] = []
+        pair_sims[key].append(sim)
+
+    for (ta, tb), sims in sorted(pair_sims.items()):
+        med = statistics.median(sims) if sims else None
+        rows.append({
+            "comparison_type":   "inter",
+            "group_a":           ta,
+            "group_b":           tb,
+            "n_members_a":       len(groups[ta]["members"]),
+            "n_members_b":       len(groups[tb]["members"]),
+            "n_pairs":           len(sims),
+            "median_similarity": f"{med:.6f}" if med is not None else "",
+        })
+
+    if not rows:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        if metadata:
+            fh.write(_metadata_comment_lines(metadata))
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()),
+                                delimiter="\t")
         writer.writeheader()
         writer.writerows(rows)
-    print(f"  Rank conservation written to: {path}")
+    print(f"  Rank TSV written to: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Focus-group cross-file matrix
+# ---------------------------------------------------------------------------
+
+def _extract_focus_medians(
+    rank_result: dict,
+    focus_group: str,
+) -> "dict[str, float] | None":
+    """Extract median similarity between *focus_group* and every other group.
+
+    Returns a dict mapping taxon_name → median similarity, where the
+    focus_group entry is its intra-group median.  Returns ``None`` if
+    *focus_group* is not present in this file's rank result.
+    """
+    groups = rank_result["groups"]
+    if focus_group not in groups:
+        return None
+
+    medians: dict[str, float] = {}
+
+    # Intra-group median for the focus group itself
+    intra_med = groups[focus_group]["intra_median"]
+    if intra_med is not None:
+        medians[focus_group] = intra_med
+
+    # Inter-group medians: focus_group ↔ each other group
+    inter_pairs = rank_result["inter_pairs"]   # (sim, ta, tb, id1, id2)
+    pair_sims: dict[str, list[float]] = {}
+    for sim, ta, tb, _id1, _id2 in inter_pairs:
+        if ta == focus_group:
+            pair_sims.setdefault(tb, []).append(sim)
+        elif tb == focus_group:
+            pair_sims.setdefault(ta, []).append(sim)
+
+    for taxon, sims in pair_sims.items():
+        medians[taxon] = statistics.median(sims)
+
+    return medians
+
+
+def _focus_dist_stats(values: list[float]) -> dict:
+    """Compute summary statistics for a list of similarity values."""
+    n = len(values)
+    if n == 0:
+        nan = float("nan")
+        return {"n": 0, "median": nan, "mean": nan, "stdev": nan,
+                "q1": nan, "q3": nan, "min": nan, "max": nan, "values": []}
+    sv = sorted(values)
+    med = statistics.median(sv)
+    mn  = statistics.mean(sv)
+    sd  = statistics.stdev(sv) if n > 1 else 0.0
+    # Quartiles
+    mid = n // 2
+    lower = sv[:mid]
+    upper = sv[mid + (n % 2):]
+    q1 = statistics.median(lower) if lower else sv[0]
+    q3 = statistics.median(upper) if upper else sv[-1]
+    return {"n": n, "median": med, "mean": mn, "stdev": sd,
+            "q1": q1, "q3": q3, "min": sv[0], "max": sv[-1], "values": sv}
+
+
+def _extract_focus_distributions(
+    rank_result: dict,
+    focus_group: str,
+) -> "dict[str, dict] | None":
+    """Extract full distributional statistics for *focus_group* vs every other group.
+
+    Returns a dict mapping taxon_name → stats dict (with keys: n, median, mean,
+    stdev, q1, q3, min, max, values).  The focus_group key holds intra-group
+    statistics.  Returns ``None`` if *focus_group* is absent.
+    """
+    groups = rank_result["groups"]
+    if focus_group not in groups:
+        return None
+
+    result: dict[str, dict] = {}
+
+    # Intra-group: raw pairwise similarities for the focus group
+    intra_sims = [s for s, *_ in groups[focus_group]["intra_pairs"]]
+    result[focus_group] = _focus_dist_stats(intra_sims)
+
+    # Inter-group: collect all pairwise sims for focus_group ↔ each other
+    inter_pairs = rank_result["inter_pairs"]
+    pair_sims: dict[str, list[float]] = {}
+    for sim, ta, tb, _id1, _id2 in inter_pairs:
+        if ta == focus_group:
+            pair_sims.setdefault(tb, []).append(sim)
+        elif tb == focus_group:
+            pair_sims.setdefault(ta, []).append(sim)
+
+    for taxon, sims in pair_sims.items():
+        result[taxon] = _focus_dist_stats(sims)
+
+    return result
+
+
+def _build_focus_full(
+    results: list[dict],
+    focus_group: str,
+) -> "tuple[list[str], list[str], list[str], list[list[dict]]]":
+    """Build a taxa × files matrix of distributional stats for *focus_group*.
+
+    Returns ``(row_names, col_names, protein_labels, stats_matrix)`` where
+    *stats_matrix[r][c]* is a stats dict (or None if the taxon is absent).
+    """
+    all_taxa: set[str] = set()
+    per_file: list[tuple[str, str, dict[str, dict]]] = []
+    for summary in results:
+        report = summary.get("_report")
+        if report is None or report.get("rank_result") is None:
+            continue
+        dists = _extract_focus_distributions(report["rank_result"], focus_group)
+        if dists is None:
+            continue
+        stem   = pathlib.Path(summary["file"]).stem
+        plabel = summary.get("protein_label", stem)
+        per_file.append((stem, plabel, dists))
+        all_taxa.update(dists.keys())
+
+    if not per_file or not all_taxa:
+        return [], [], [], []
+
+    others = sorted(all_taxa - {focus_group})
+    row_names = ([focus_group] if focus_group in all_taxa else []) + others
+    col_names      = [s for s, _p, _d in per_file]
+    protein_labels = [p for _s, p, _d in per_file]
+
+    stats_matrix: list[list] = []
+    for taxon in row_names:
+        row = []
+        for _stem, _plabel, dists in per_file:
+            row.append(dists.get(taxon))
+        stats_matrix.append(row)
+
+    return row_names, col_names, protein_labels, stats_matrix
+
+
+def _build_focus_matrix(
+    results: list[dict],
+    focus_group: str,
+) -> "tuple[list[str], list[str], list[str], list[list[float]]]":
+    """Build a taxa × files matrix of median similarity to *focus_group*.
+
+    Returns ``(row_names, col_names, protein_labels, matrix)`` where
+    *row_names* are the taxonomic group names (sorted, focus_group first),
+    *col_names* are file stems, *protein_labels* are the inferred
+    consensus protein names for each file (parallel to *col_names*), and
+    *matrix[r][c]* is the median similarity (or NaN if that taxon is
+    absent in the file).
+    """
+    nan = float("nan")
+
+    # Collect per-file medians and union of taxon names
+    all_taxa: set[str] = set()
+    per_file: list[tuple[str, str, dict[str, float]]] = []
+    for summary in results:
+        report = summary.get("_report")
+        if report is None or report.get("rank_result") is None:
+            continue
+        medians = _extract_focus_medians(report["rank_result"], focus_group)
+        if medians is None:
+            continue
+        stem  = pathlib.Path(summary["file"]).stem
+        plabel = summary.get("protein_label", stem)
+        per_file.append((stem, plabel, medians))
+        all_taxa.update(medians.keys())
+
+    if not per_file or not all_taxa:
+        return [], [], [], []
+
+    # Row order: focus_group first (intra), then others alphabetically
+    others = sorted(all_taxa - {focus_group})
+    row_names = ([focus_group] if focus_group in all_taxa else []) + others
+    col_names      = [stem   for stem, _pl, _m in per_file]
+    protein_labels = [plabel for _s, plabel, _m in per_file]
+
+    matrix: list[list[float]] = []
+    for taxon in row_names:
+        row: list[float] = []
+        for _stem, _plabel, medians in per_file:
+            row.append(medians.get(taxon, nan))
+        matrix.append(row)
+
+    return row_names, col_names, protein_labels, matrix
+
+
+def _write_focus_tsv(
+    path: pathlib.Path,
+    focus_group: str,
+    rank: str,
+    row_names: list[str],
+    col_names: list[str],
+    protein_labels: list[str],
+    matrix: list[list[float]],
+) -> None:
+    """Write the focus-group cross-file matrix as a TSV table."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as fh:
+        fh.write(f"# Focus group: {focus_group}  (rank: {rank})\n")
+        fh.write(f"# Rows: taxonomic groups; first row is intra-group "
+                 f"median for {focus_group}\n")
+        fh.write(f"# Columns: input files  (second header row: inferred "
+                 f"protein name)\n")
+        writer = csv.writer(fh, delimiter="\t")
+        writer.writerow(["group"] + col_names)
+        writer.writerow(["# protein"] + protein_labels)
+        for taxon, row in zip(row_names, matrix):
+            formatted = []
+            for v in row:
+                if math.isnan(v):
+                    formatted.append("")
+                else:
+                    formatted.append(f"{v:.6f}")
+            writer.writerow([taxon] + formatted)
+    print(f"  Focus-group TSV written to: {path}")
+
+
+def _plot_focus_heatmap(
+    path: pathlib.Path,
+    focus_group: str,
+    rank: str,
+    row_names: list[str],
+    col_names: list[str],
+    protein_labels: list[str],
+    matrix: list[list[float]],
+    stats_matrix: "list[list] | None" = None,
+) -> None:
+    """Save a taxa × files heatmap of median similarity to *focus_group*.
+
+    If *stats_matrix* is provided (parallel to *matrix*), cells display
+    ``median (Q1–Q3)`` instead of just the median, giving a richer view
+    of the distribution of pairwise similarities.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        import numpy as np
+    except ImportError:
+        print(
+            "  Warning: matplotlib is not installed – focus heatmap skipped.\n"
+            "  Install it with:  pip install matplotlib",
+            file=sys.stderr,
+        )
+        return
+
+    nrows = len(row_names)
+    ncols = len(col_names)
+    if nrows < 1 or ncols < 1:
+        print("  Note: focus heatmap needs at least 1 row and 1 column – skipped.")
+        return
+
+    mat = np.array(matrix, dtype=float)
+
+    cell_w = max(1.0, min(2.0, 14.0 / ncols))
+    cell_h = max(0.6, min(1.4, 10.0 / nrows))
+    fig_w  = max(6.0, ncols * cell_w + 4.0)
+    fig_h  = max(3.0, nrows * cell_h + 2.5)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    cmap = plt.get_cmap("RdYlGn").copy()
+    cmap.set_bad(color="#d3d3d3")
+
+    im = ax.imshow(mat, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto")
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Median pairwise similarity", fontsize=9)
+    cbar.ax.tick_params(labelsize=8)
+
+    # Cell text — show "median (Q1–Q3) n=N" when stats available
+    fs = max(5, min(9, int(min(cell_w, cell_h) * 5.0)))
+    fs_sub = max(4, fs - 2)
+    for i in range(nrows):
+        for j in range(ncols):
+            val = mat[i, j]
+            if np.isnan(val):
+                ax.text(j, i, "n/a", ha="center", va="center",
+                        fontsize=fs, color="#888888")
+                continue
+            txt_col = "white" if val < 0.22 or val > 0.82 else "black"
+            bold = (row_names[i] == focus_group)
+            fw = "bold" if bold else "normal"
+            st = None
+            if stats_matrix is not None:
+                st = stats_matrix[i][j]
+            if st is not None and st["n"] > 1:
+                # Rich annotation: median on first line, (Q1–Q3) n=N below
+                ax.text(j, i - 0.15, f"{st['median']:.3f}",
+                        ha="center", va="center", fontsize=fs,
+                        color=txt_col, fontweight=fw)
+                ax.text(j, i + 0.15,
+                        f"({st['q1']:.2f}\u2013{st['q3']:.2f}) n={st['n']}",
+                        ha="center", va="center", fontsize=fs_sub,
+                        color=txt_col, fontweight="normal")
+            else:
+                n_str = ""
+                if st is not None:
+                    n_str = f"\nn={st['n']}"
+                ax.text(j, i, f"{val:.3f}{n_str}",
+                        ha="center", va="center", fontsize=fs,
+                        color=txt_col, fontweight=fw)
+
+    # Highlight the focus_group row (intra)
+    if focus_group in row_names:
+        fg_idx = row_names.index(focus_group)
+        rect = plt.Rectangle(
+            (-0.5, fg_idx - 0.5), ncols, 1,
+            linewidth=2.2, edgecolor="black", facecolor="none",
+        )
+        ax.add_patch(rect)
+
+    ax.set_xticks(range(ncols))
+    ax.set_yticks(range(nrows))
+    label_fs = max(7, min(10, int(min(cell_w, cell_h) * 5.5)))
+    # Two-line x-axis labels: filename + inferred protein name
+    x_labels = []
+    for stem, plabel in zip(col_names, protein_labels):
+        if plabel and plabel != stem:
+            # Truncate long protein names for readability
+            short = plabel if len(plabel) <= 40 else plabel[:37] + "..."
+            x_labels.append(f"{stem}\n({short})")
+        else:
+            x_labels.append(stem)
+    ax.set_xticklabels(x_labels, rotation=40, ha="right", fontsize=label_fs)
+    ax.set_yticklabels(row_names, fontsize=label_fs, style="italic")
+
+    # Mark intra vs inter in row labels
+    ax.set_ylabel("Taxonomic group", fontsize=9)
+    ax.set_xlabel("Input file  (inferred protein name)", fontsize=9)
+    ax.set_title(
+        f"Conservation relative to {focus_group}  ·  rank: {rank}\n"
+        f"bordered row = within-{rank} (intra)   ·   "
+        f"other rows = between-{rank} (inter)",
+        fontsize=10, pad=14,
+    )
+
+    na_patch = mpatches.Patch(
+        facecolor="#d3d3d3", edgecolor="#999999",
+        label="n/a  (group absent in file)",
+    )
+    ax.legend(
+        handles=[na_patch],
+        loc="upper left", bbox_to_anchor=(1.18, 1.02),
+        fontsize=8, framealpha=0.85,
+    )
+
+    plt.tight_layout()
+    try:
+        plt.savefig(str(path), dpi=150, bbox_inches="tight")
+    except ValueError as exc:
+        print(f"  Error saving focus heatmap: {exc}", file=sys.stderr)
+        plt.close(fig)
+        return
+    plt.close(fig)
+    print(f"  Focus-group heatmap written to: {path}")
+
+
+def _write_focus_detailed_tsv(
+    path: pathlib.Path,
+    focus_group: str,
+    rank: str,
+    row_names: list[str],
+    col_names: list[str],
+    protein_labels: list[str],
+    stats_matrix: list[list],
+) -> None:
+    """Write a detailed focus-group TSV with full distributional statistics.
+
+    For each (group, file) cell the TSV includes: median, mean, stdev,
+    Q1, Q3, min, max, and the number of pairwise comparisons.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as fh:
+        fh.write(f"# Focus group: {focus_group}  (rank: {rank})\n")
+        fh.write("# Detailed distributional statistics per group per file\n")
+        writer = csv.writer(fh, delimiter="\t")
+        writer.writerow([
+            "group", "file", "protein", "n_pairs",
+            "median", "mean", "stdev", "q1", "q3", "min", "max",
+        ])
+        for i, taxon in enumerate(row_names):
+            for j, (stem, plabel) in enumerate(zip(col_names, protein_labels)):
+                st = stats_matrix[i][j]
+                if st is None:
+                    writer.writerow([taxon, stem, plabel, 0,
+                                     "", "", "", "", "", "", ""])
+                else:
+                    def _f(v: float) -> str:
+                        return "" if math.isnan(v) else f"{v:.6f}"
+                    writer.writerow([
+                        taxon, stem, plabel, st["n"],
+                        _f(st["median"]), _f(st["mean"]), _f(st["stdev"]),
+                        _f(st["q1"]), _f(st["q3"]), _f(st["min"]), _f(st["max"]),
+                    ])
+    print(f"  Focus-group detailed TSV written to: {path}")
+
+
+def _plot_focus_violin(
+    path: pathlib.Path,
+    focus_group: str,
+    rank: str,
+    row_names: list[str],
+    col_names: list[str],
+    protein_labels: list[str],
+    stats_matrix: list[list],
+) -> None:
+    """Save a multi-panel violin + box plot of similarity distributions.
+
+    One panel (subplot column) per input file.  Within each panel, one
+    violin per taxonomic group showing the full distribution of pairwise
+    similarities with the focus group.  The focus group's own violin
+    represents intra-group similarity and is highlighted in a distinct colour.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        import numpy as np                              # noqa: F811
+    except ImportError:
+        print(
+            "  Warning: matplotlib is not installed – focus violin plot skipped.\n"
+            "  Install it with:  pip install matplotlib",
+            file=sys.stderr,
+        )
+        return
+
+    nrows = len(row_names)
+    ncols = len(col_names)
+    if nrows < 1 or ncols < 1:
+        return
+
+    # Colour palette: focus group gets a distinct teal; others get a muted blue
+    clr_focus = "#009688"
+    clr_inter = "#5C6BC0"
+    clr_empty = "#cccccc"
+
+    fig_w = max(5.0, ncols * 3.2 + 1.5)
+    fig_h = max(4.0, nrows * 0.55 + 2.5)
+    fig, axes = plt.subplots(1, ncols, figsize=(fig_w, fig_h),
+                             sharey=True, squeeze=False)
+
+    for j in range(ncols):
+        ax = axes[0][j]
+        # Collect data & colours for this file column
+        data = []
+        colors = []
+        labels = []
+        for i in range(nrows):
+            st = stats_matrix[i][j]
+            vals = st["values"] if st is not None else []
+            data.append(vals if vals else [float("nan")])
+            colors.append(clr_focus if row_names[i] == focus_group else clr_inter)
+            labels.append(row_names[i])
+
+        positions = list(range(nrows))
+
+        # Violin plot (untrimmed: extend KDE beyond data range)
+        non_empty = [k for k in range(nrows) if len(data[k]) > 1
+                     and not (len(data[k]) == 1 and data[k][0] != data[k][0])]
+        try:
+            from scipy.stats import gaussian_kde
+            _focus_has_scipy = True
+        except ImportError:
+            _focus_has_scipy = False
+
+        if non_empty and _focus_has_scipy:
+            for k in non_empty:
+                arr = np.array(data[k], dtype=float)
+                if len(arr) < 2:
+                    continue
+                kde = gaussian_kde(arr)
+                bw  = kde.scotts_factor() * arr.std(ddof=1)
+                lo  = max(arr.min() - 2 * bw, 0.0)
+                hi  = min(arr.max() + 2 * bw, 1.0)
+                xs  = np.linspace(lo, hi, 300)
+                density = kde(xs)
+                density = density / density.max() * 0.35
+                pos = positions[k]
+                ax.fill_between(xs, pos - density, pos + density,
+                                facecolor=colors[k], alpha=0.35)
+        elif non_empty:
+            # Fallback: matplotlib built-in (trimmed)
+            vparts = ax.violinplot(
+                [data[k] for k in non_empty],
+                positions=[positions[k] for k in non_empty],
+                showextrema=False, showmedians=False, vert=False, widths=0.7,
+            )
+            for idx, body in enumerate(vparts["bodies"]):
+                body.set_facecolor(colors[non_empty[idx]])
+                body.set_alpha(0.35)
+
+        # Box plot overlay
+        bp = ax.boxplot(
+            data, positions=positions, vert=False, widths=0.35,
+            patch_artist=True, showfliers=True,
+            flierprops={"marker": ".", "markersize": 3, "alpha": 0.5},
+            medianprops={"color": "black", "linewidth": 1.5},
+            whiskerprops={"linewidth": 0.8},
+            capprops={"linewidth": 0.8},
+        )
+        for k, patch in enumerate(bp["boxes"]):
+            patch.set_facecolor(colors[k])
+            patch.set_alpha(0.55)
+
+        # N annotations on right side
+        for i in range(nrows):
+            st = stats_matrix[i][j]
+            n = st["n"] if st is not None else 0
+            ax.text(1.02, positions[i], f"n={n}", fontsize=6, color="#666666",
+                    va="center", ha="left", transform=ax.get_yaxis_transform())
+
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_yticks(positions)
+        if j == 0:
+            ax.set_yticklabels(labels, fontsize=7, style="italic")
+        else:
+            ax.set_yticklabels([])
+
+        # File label
+        plabel = protein_labels[j]
+        if plabel and plabel != col_names[j]:
+            short = plabel if len(plabel) <= 30 else plabel[:27] + "..."
+            title = f"{col_names[j]}\n({short})"
+        else:
+            title = col_names[j]
+        ax.set_title(title, fontsize=8, pad=6)
+        ax.set_xlabel("Pairwise similarity", fontsize=7)
+        ax.tick_params(axis="x", labelsize=7)
+        ax.axvline(0.5, color="#cccccc", linewidth=0.5, linestyle="--", zorder=0)
+
+    # Legend
+    intra_patch = mpatches.Patch(facecolor=clr_focus, alpha=0.55,
+                                 label=f"Intra-{rank} ({focus_group})")
+    inter_patch = mpatches.Patch(facecolor=clr_inter, alpha=0.55,
+                                 label=f"Inter-{rank}")
+    fig.legend(handles=[intra_patch, inter_patch],
+               loc="lower center", ncol=2, fontsize=8,
+               framealpha=0.9, bbox_to_anchor=(0.5, -0.02))
+
+    fig.suptitle(
+        f"Pairwise similarity distributions relative to {focus_group}  "
+        f"(rank: {rank})",
+        fontsize=10, y=1.02,
+    )
+    plt.tight_layout()
+    try:
+        plt.savefig(str(path), dpi=150, bbox_inches="tight")
+    except ValueError as exc:
+        print(f"  Error saving focus violin plot: {exc}", file=sys.stderr)
+        plt.close(fig)
+        return
+    plt.close(fig)
+    print(f"  Focus-group violin plot written to: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Organism-labelled identifiers
+# ---------------------------------------------------------------------------
+
+def _make_display_ids(
+    ids: list[str],
+    tax_map: dict,
+    org_hints: dict,
+    use_org: bool,
+) -> list[str]:
+    """
+    Return a display-label list for *ids*.
+
+    When *use_org* is True each identifier is formatted as
+    ``accession|Organism_name`` (whitespace in the organism name replaced
+    by underscores).  The organism name is taken from *tax_map* first
+    (``TaxInfo.scientific_name``), falling back to *org_hints* (parsed
+    from the FASTA header).  Accessions with no organism source are left
+    unchanged.
+
+    When *use_org* is False the original *ids* list is returned as-is.
+    """
+    if not use_org:
+        return list(ids)
+    result = []
+    for acc in ids:
+        org = ""
+        if acc in tax_map:
+            org = tax_map[acc].scientific_name
+        elif acc in org_hints:
+            org = org_hints[acc]
+        if org:
+            result.append(f"{acc}|{org.replace(' ', '_')}")
+        else:
+            result.append(acc)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2027,13 +3585,17 @@ def _write_rank_csv(path: pathlib.Path, result: dict) -> None:
 def _analyse_fasta(
     args:             argparse.Namespace,
     fasta_path:       pathlib.Path,
-    out_matrix:       pathlib.Path | None,
-    out_conservation: pathlib.Path | None,
-    out_rank_csv:     pathlib.Path | None,
-    heatmap_path:     pathlib.Path | None,
-    dendrogram_path:  pathlib.Path | None,
-    phyloxml_path:    pathlib.Path | None,
+    out_matrix:       "pathlib.Path | None",
+    out_conservation: "pathlib.Path | None",
+    out_rank_tsv:     "pathlib.Path | None",
+    heatmap_path:     "pathlib.Path | None",
+    dendrogram_path:  "pathlib.Path | None",
+    phyloxml_path:    "pathlib.Path | None",
+    newick_path:      "pathlib.Path | None",
+    violin_path:      "pathlib.Path | None",
     cache:            "TaxCache | None",
+    logger:           "logging.Logger | None" = None,
+    timer:            "PhaseTimer | None" = None,
 ) -> dict:
     """
     Run the full conservation analysis for one FASTA file.
@@ -2049,20 +3611,31 @@ def _analyse_fasta(
         "outputs": [], "error": None,
     }
 
+    _log = logger or logging.getLogger("prot_ction")
+
     try:
+        # ── metadata ──────────────────────────────────────────────────────
+        metadata = _build_metadata(args, fasta_path)
+
         # ── load ──────────────────────────────────────────────────────────
+        if timer:
+            timer.start("parse")
         print(f"Reading: {fasta_path}")
-        records = parse_fasta(str(fasta_path))
+        _log.info("Parsing %s", fasta_path)
+        records = parse_alignment(str(fasta_path))
         if not records:
             summary["error"] = "no sequences found"
             return summary
         summary["n_seqs"] = len(records)
 
         # ── taxonomy (optional) ───────────────────────────────────────────
+        if timer:
+            timer.start("taxonomy")
         tax_map: dict[str, TaxInfo] = {}
+        db_protein_names: dict[str, str] = {}
         if args.rank:
             print(f"\nFetching taxonomy for {len(records)} sequence(s)…")
-            tax_map = fetch_all_taxonomies(
+            tax_map, db_protein_names = fetch_all_taxonomies(
                 records, api_key=args.ncbi_api_key, cache=cache
             )
             before  = len(records)
@@ -2077,12 +3650,24 @@ def _analyse_fasta(
         summary["n_kept"] = len(records)
         print_sequence_table(records)
 
+        # ── pre-flight QC ─────────────────────────────────────────────────
+        qc = preflight_qc(records)
+        print_preflight_qc(qc)
+        _log.info("QC: %d seqs, lengths %d–%d, %.1f%% gaps",
+                  qc["n_sequences"], qc["length_min"], qc["length_max"],
+                  qc["gap_fraction"] * 100)
+
         if len(records) < 2:
             summary["error"] = "fewer than 2 sequences"
             return summary
 
-        ids  = [r[0] for r in records]
-        seqs = [r[2] for r in records]
+        ids      = [r[0] for r in records]
+        seqs     = [r[2] for r in records]
+        org_hints = {r[0]: r[3] for r in records}
+
+        # Build display labels (accession|Organism_name when --organism-labels)
+        use_org_labels = getattr(args, "organism_labels", False)
+        display_ids = _make_display_ids(ids, tax_map, org_hints, use_org_labels)
 
         # ── mode / gap handling ───────────────────────────────────────────
         mode = args.mode
@@ -2153,11 +3738,27 @@ def _analyse_fasta(
         mat_min = _matrix_min(score_matrix) if score_matrix else 0
 
         # ── pairwise similarity ───────────────────────────────────────────
+        if timer:
+            timer.start("similarity")
         label = scoring.upper() if scoring != "hamming" else "Hamming"
         print(f"\nScoring: {label}")
         print("Computing pairwise similarities…")
         sim_mat, off_mat = pairwise_matrix(seqs, score_matrix, mat_min)
-        print_pairwise_summary(ids, seqs, sim_mat, off_mat)
+        _log.info("Pairwise similarity matrix computed (%d×%d)", len(ids), len(ids))
+        print_pairwise_summary(display_ids, seqs, sim_mat, off_mat)
+
+        # ── near-duplicate detection ──────────────────────────────────────
+        dup_threshold = getattr(args, "dup_threshold", 0.98)
+        near_dupes = detect_near_duplicates(ids, sim_mat, dup_threshold)
+        if near_dupes:
+            print(f"\n  ⚠ Near-duplicate warning: {len(near_dupes)} pair(s) "
+                  f"with similarity ≥ {dup_threshold:.2f}")
+            for a, b, s in near_dupes[:5]:
+                print(f"    {a} <-> {b}:  {s:.4f}")
+            if len(near_dupes) > 5:
+                print(f"    … and {len(near_dupes) - 5} more")
+            _log.warning("%d near-duplicate pair(s) at threshold %.2f",
+                         len(near_dupes), dup_threshold)
 
         all_pairs = [
             sim_mat[i][j]
@@ -2167,53 +3768,34 @@ def _analyse_fasta(
 
         if args.matrix:
             print_pairwise_matrix(
-                ids, sim_mat, off_mat if not is_aligned else None
+                display_ids, sim_mat, off_mat if not is_aligned else None
             )
 
         if out_matrix is not None:
             out_matrix.parent.mkdir(parents=True, exist_ok=True)
             try:
                 _guard(out_matrix, args.overwrite)
-                write_matrix_csv(str(out_matrix), ids, sim_mat)
+                write_matrix_csv(str(out_matrix), display_ids, sim_mat,
+                                 metadata=metadata)
                 summary["outputs"].append(str(out_matrix))
             except FileExistsError as exc:
                 print(f"  Skipped: {exc}", file=sys.stderr)
 
-        dend_method = getattr(args, "dendrogram_method", "average")
-
-        if dendrogram_path is not None:
-            dendrogram_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                _guard(dendrogram_path, args.overwrite)
-                plot_dendrogram(ids, sim_mat, str(dendrogram_path),
-                                method=dend_method)
-                summary["outputs"].append(str(dendrogram_path))
-            except FileExistsError as exc:
-                print(f"  Skipped: {exc}", file=sys.stderr)
-
-        if phyloxml_path is not None:
-            phyloxml_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                _guard(phyloxml_path, args.overwrite)
-                export_phyloxml(ids, sim_mat, str(phyloxml_path),
-                                method=dend_method)
-                summary["outputs"].append(str(phyloxml_path))
-            except FileExistsError as exc:
-                print(f"  Skipped: {exc}", file=sys.stderr)
-
         # ── per-position conservation ─────────────────────────────────────
+        if timer:
+            timer.start("conservation")
         if is_aligned:
             print("\nComputing per-position conservation…")
             aligned_seqs = seqs
         else:
             ref_idx = lengths.index(max(lengths))
             print(
-                f"\nBuilding virtual alignment using '{ids[ref_idx]}' as "
+                f"\nBuilding virtual alignment using '{display_ids[ref_idx]}' as "
                 f"reference (length {lengths[ref_idx]} aa)…"
             )
             offsets = best_offsets_vs_reference(seqs, ref_idx,
                                                    score_matrix, mat_min)
-            for i, (seq_id, off) in enumerate(zip(ids, offsets)):
+            for i, (seq_id, off) in enumerate(zip(display_ids, offsets)):
                 if i != ref_idx:
                     print(f"  {seq_id}: placed at offset {off}"
                           f"  (covers positions {off+1}–{off+len(seqs[i])})")
@@ -2229,21 +3811,34 @@ def _analyse_fasta(
                                            weights=seq_weights)
         print_position_summary(scores, aligned_seqs, args.top)
 
+        # ── Shannon entropy / information content ─────────────────────────
+        entropy = per_position_entropy(aligned_seqs)
+        mean_h  = sum(h for h, _ in entropy) / len(entropy) if entropy else 0.0
+        mean_ic = sum(ic for _, ic in entropy) / len(entropy) if entropy else 0.0
+        print(f"\n  Shannon entropy:         mean {mean_h:.3f} bits/position")
+        print(f"  Information content:     mean {mean_ic:.3f} bits/position")
+        _log.info("Entropy: mean H=%.3f, IC=%.3f bits", mean_h, mean_ic)
+
         if out_conservation is not None:
             out_conservation.parent.mkdir(parents=True, exist_ok=True)
             try:
                 _guard(out_conservation, args.overwrite)
-                write_conservation_csv(str(out_conservation), scores)
+                write_conservation_csv(str(out_conservation), scores,
+                                       entropy=entropy, metadata=metadata)
                 summary["outputs"].append(str(out_conservation))
             except FileExistsError as exc:
                 print(f"  Skipped: {exc}", file=sys.stderr)
 
         # ── rank-based taxonomy conservation ──────────────────────────────
-        rank_result: dict | None = None
-        perm_result: dict | None = None
+        if timer:
+            timer.start("rank_analysis")
+        rank_result: "dict | None" = None
+        perm_result: "dict | None" = None
         if args.rank:
+            n_boot = getattr(args, "bootstrap", 0)
             rank_result = rank_conservation(
-                ids, seqs, sim_mat, tax_map, args.rank
+                ids, seqs, sim_mat, tax_map, args.rank,
+                n_bootstrap=n_boot,
             )
             n_perm = getattr(args, "permutations", 0)
             if n_perm > 0:
@@ -2252,7 +3847,8 @@ def _analyse_fasta(
                     ids, sim_mat, tax_map, args.rank,
                     n_permutations=n_perm,
                 )
-            print_rank_conservation(rank_result, ids, tax_map, perm_result)
+            print_rank_conservation(rank_result, ids, tax_map, perm_result,
+                                        display_ids=display_ids)
 
             summary["intra_median"] = rank_result["intra_median"]
             summary["inter_median"] = rank_result["inter_median"]
@@ -2280,28 +3876,101 @@ def _analyse_fasta(
                 )
                 print(f"  Available ranks in this dataset: {', '.join(avail)}")
 
-            if out_rank_csv is not None and rank_result["groups"]:
+            # ── violin plot ────────────────────────────────────────────
+            if violin_path is not None:
                 try:
-                    _guard(out_rank_csv, args.overwrite)
-                    _write_rank_csv(out_rank_csv, rank_result)
-                    summary["outputs"].append(str(out_rank_csv))
+                    _guard(violin_path, args.overwrite)
+                    plot_violin(rank_result, str(violin_path))
+                    summary["outputs"].append(str(violin_path))
                 except FileExistsError as exc:
                     print(f"  Skipped: {exc}", file=sys.stderr)
 
-        elif heatmap_path is not None:
-            print(
-                "  Note: --heatmap requires --rank to be set; "
-                "heatmap skipped for this file.",
-                file=sys.stderr,
+            if out_rank_tsv is not None and rank_result["groups"]:
+                try:
+                    _guard(out_rank_tsv, args.overwrite)
+                    _write_rank_tsv(out_rank_tsv, rank_result,
+                                    metadata=metadata)
+                    summary["outputs"].append(str(out_rank_tsv))
+                except FileExistsError as exc:
+                    print(f"  Skipped: {exc}", file=sys.stderr)
+
+        elif heatmap_path is not None or violin_path is not None:
+            if heatmap_path:
+                print(
+                    "  Note: --heatmap requires --rank to be set; "
+                    "heatmap skipped for this file.",
+                    file=sys.stderr,
+                )
+            if violin_path:
+                print(
+                    "  Note: --violin requires --rank to be set; "
+                    "violin plot skipped for this file.",
+                    file=sys.stderr,
+                )
+
+        # ── dendrogram / phyloxml ─────────────────────────────────────────
+        # When --rank is active and produced ≥2 groups, cluster the groups
+        # (leaves = taxa) using between-group median similarity.
+        # Otherwise fall back to clustering individual sequences.
+        dend_method = getattr(args, "dendrogram_method", "average")
+        if (rank_result is not None
+                and len(rank_result["groups"]) >= 2):
+            dend_ids, dend_sim = group_sim_matrix(rank_result)
+            dend_title = (
+                f"Hierarchical clustering  ·  {dend_method} linkage  ·  "
+                f"{len(dend_ids)} {args.rank} groups  ·  "
+                f"between-group median similarity"
             )
+        else:
+            dend_ids, dend_sim = display_ids, sim_mat
+            dend_title = None   # plot_dendrogram uses its own default
+
+        if dendrogram_path is not None:
+            dendrogram_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                _guard(dendrogram_path, args.overwrite)
+                plot_dendrogram(dend_ids, dend_sim, str(dendrogram_path),
+                                method=dend_method, title=dend_title)
+                summary["outputs"].append(str(dendrogram_path))
+            except FileExistsError as exc:
+                print(f"  Skipped: {exc}", file=sys.stderr)
+
+        if phyloxml_path is not None:
+            phyloxml_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                _guard(phyloxml_path, args.overwrite)
+                export_phyloxml(dend_ids, dend_sim, str(phyloxml_path),
+                                method=dend_method)
+                summary["outputs"].append(str(phyloxml_path))
+            except FileExistsError as exc:
+                print(f"  Skipped: {exc}", file=sys.stderr)
+
+        if newick_path is not None:
+            newick_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                _guard(newick_path, args.overwrite)
+                export_newick(dend_ids, dend_sim, str(newick_path),
+                              method=dend_method)
+                summary["outputs"].append(str(newick_path))
+            except FileExistsError as exc:
+                print(f"  Skipped: {exc}", file=sys.stderr)
+
+        # ── timing ─────────────────────────────────────────────────────────
+        if timer:
+            timer.start("output")
 
         # ── collect data for HTML/PDF report ──────────────────────────────
+        summary["protein_label"] = _infer_protein_label(
+            str(fasta_path), db_protein_names=db_protein_names or None
+        )
         summary["_report"] = {
             "records":             records,
             "ids":                 ids,
+            "display_ids":         display_ids,
             "sim_mat":             sim_mat,
             "off_mat":             off_mat,
             "conservation_scores": scores,
+            "entropy":             entropy,
             "is_aligned":          is_aligned,
             "scoring":             scoring,
             "rank_result":         rank_result,
@@ -2309,10 +3978,21 @@ def _analyse_fasta(
             "perm_result":         perm_result,
             "seq_weights":         seq_weights,
             "dendrogram_method":   getattr(args, "dendrogram_method", "average"),
+            "dend_ids":            dend_ids,
+            "dend_sim":            dend_sim,
+            "dend_title":          dend_title,
+            "qc":                  qc,
+            "near_dupes":          near_dupes,
+            "metadata":            metadata,
         }
 
     except Exception as exc:          # noqa: BLE001 – catch-all for per-file resilience
         summary["error"] = str(exc)
+        _log.error("Analysis failed for %s: %s", fasta_path, exc)
+
+    if timer:
+        timer.end()
+        _log.info("Timing:\n%s", timer.summary())
 
     return summary
 
@@ -2393,7 +4073,7 @@ def _h(s: object) -> str:
 def _sim_color(v: float) -> str:
     """HSL background colour for a similarity value in [0, 1]."""
     try:
-        if v != v:          # NaN guard
+        if math.isnan(v):
             return "#d8d8d8"
         v = max(0.0, min(1.0, float(v)))
         return f"hsl({int(v * 120)},60%,88%)"
@@ -2454,13 +4134,14 @@ def _heatmap_b64(rank_result: dict) -> str | None:
 
 
 def _dendrogram_b64(ids: list[str], sim_mat: list[list[float]],
-                    method: str = "average") -> str | None:
+                    method: str = "average",
+                    title: "str | None" = None) -> "str | None":
     """Render a dendrogram to an embedded base64 PNG string."""
     import os, tempfile, base64
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         tmp = f.name
     try:
-        plot_dendrogram(ids, sim_mat, tmp, method=method)
+        plot_dendrogram(ids, sim_mat, tmp, method=method, title=title)
         with open(tmp, "rb") as f:
             data = f.read()
         return base64.b64encode(data).decode() if data else None
@@ -2559,9 +4240,9 @@ def _html_summary_table(results: list[dict], rank: str | None) -> str:
 
 def _html_seq_table(records: list) -> str:
     rows = "".join(
-        f'<tr><td class="bold">{_h(acc)}</td><td>{_h(db)}</td>'
-        f'<td>{len(seq):,}</td></tr>'
-        for acc, db, seq in records
+        f'<tr><td class="bold">{_h(r[0])}</td><td>{_h(r[1])}</td>'
+        f'<td>{len(r[2]):,}</td></tr>'
+        for r in records
     )
     return (
         '<h3>Sequences</h3>'
@@ -2652,8 +4333,15 @@ def _html_rank_section(rank_result: dict, tax_map: dict,
             f'<span class="bold">{med:.4f}</span></td></tr>'
         )
 
-    intra_s = f"{intra_med:.4f}" if intra_med is not None else "n/a"
-    inter_s = f"{inter_med:.4f}" if inter_med is not None else "n/a"
+    # Bootstrap CIs
+    intra_ci = rank_result.get("intra_ci")
+    inter_ci = rank_result.get("inter_ci")
+    intra_ci_s = (f" &nbsp; 95% CI [{intra_ci[0]:.4f}, {intra_ci[1]:.4f}]"
+                  if intra_ci else "")
+    inter_ci_s = (f" &nbsp; 95% CI [{inter_ci[0]:.4f}, {inter_ci[1]:.4f}]"
+                  if inter_ci else "")
+    intra_s = f"{intra_med:.4f}{intra_ci_s}" if intra_med is not None else "n/a"
+    inter_s = f"{inter_med:.4f}{inter_ci_s}" if inter_med is not None else "n/a"
     diff_note = ""
     if intra_med is not None and inter_med is not None:
         direction = "higher" if intra_med > inter_med else "lower"
@@ -2709,6 +4397,16 @@ def _html_rank_section(rank_result: dict, tax_map: dict,
                 f'p = <strong>{_h(pval_str)}</strong>{sig_badge}</p>'
             )
 
+    # Violin plot
+    violin_img = ""
+    vb64 = plot_violin(rank_result)
+    if vb64:
+        violin_img = (
+            f'<h3>Similarity Distributions (violin plot)</h3>'
+            f'<img class="plot" src="data:image/png;base64,{vb64}" '
+            f'alt="Violin plot">'
+        )
+
     return (
         f'<h3>Taxonomic Conservation — grouped by {_h(rank)}</h3>'
         f'<table><thead><tr><th>Accession</th><th>Organism</th>'
@@ -2727,6 +4425,7 @@ def _html_rank_section(rank_result: dict, tax_map: dict,
         + diff_note
         + perm_section
         + heatmap_img
+        + violin_img
     )
 
 
@@ -2747,7 +4446,7 @@ def _html_file_section(summary: dict, file_id: str,
                 f'<div class="error-box">No analysis data available.</div></div>')
 
     records     = rpt["records"]
-    ids         = rpt["ids"]
+    ids         = rpt.get("display_ids") or rpt["ids"]
     sim_mat     = rpt["sim_mat"]
     off_mat     = rpt["off_mat"]
     scores      = rpt["conservation_scores"]
@@ -2758,20 +4457,90 @@ def _html_file_section(summary: dict, file_id: str,
 
     scoring_label = scoring.upper() if scoring != "hamming" else "Hamming"
     mode_label    = "aligned (MSA)" if is_aligned else "unaligned (sliding)"
-    meta = (f'<p class="meta">'
-            f'<strong>{len(records)}</strong> sequences &nbsp;·&nbsp; '
-            f'Mode: <strong>{_h(mode_label)}</strong> &nbsp;·&nbsp; '
-            f'Scoring: <strong>{_h(scoring_label)}</strong></p>')
+    meta_html = (f'<p class="meta">'
+                 f'<strong>{len(records)}</strong> sequences &nbsp;·&nbsp; '
+                 f'Mode: <strong>{_h(mode_label)}</strong> &nbsp;·&nbsp; '
+                 f'Scoring: <strong>{_h(scoring_label)}</strong></p>')
 
-    # Conservation plot (or text fallback)
+    # ── Reproducibility metadata ──────────────────────────────────────
+    file_meta = rpt.get("metadata") or {}
+    meta_block = ""
+    if file_meta:
+        meta_rows = "".join(
+            f'<tr><td style="font-weight:600">{_h(k)}</td>'
+            f'<td style="word-break:break-all">{_h(v)}</td></tr>'
+            for k, v in file_meta.items()
+        )
+        meta_block = (
+            '<details style="margin:.5rem 0"><summary style="cursor:pointer;'
+            'font-size:.85rem;color:#555">Reproducibility metadata</summary>'
+            '<table style="font-size:.82rem;margin:.3rem 0">'
+            f'{meta_rows}</table></details>'
+        )
+
+    # ── Pre-flight QC ─────────────────────────────────────────────────
+    qc = rpt.get("qc")
+    qc_block = ""
+    if qc:
+        qc_block = (
+            '<h3>Input Quality Summary</h3>'
+            f'<table style="font-size:.88rem;width:auto">'
+            f'<tr><td style="font-weight:600">Sequences</td>'
+            f'<td>{qc["n_sequences"]}</td></tr>'
+            f'<tr><td style="font-weight:600">Length range</td>'
+            f'<td>{qc["length_min"]}\u2013{qc["length_max"]} aa</td></tr>'
+            f'<tr><td style="font-weight:600">Length mean / median</td>'
+            f'<td>{qc["length_mean"]:.1f} / {qc["length_median"]:.1f} aa</td></tr>'
+            f'<tr><td style="font-weight:600">Gap characters</td>'
+            f'<td>{qc["gap_count"]:,} ({qc["gap_fraction"]:.1%})</td></tr>'
+            f'<tr><td style="font-weight:600">Ambiguous (X/B/Z/J)</td>'
+            f'<td>{qc["ambiguous_count"]:,} ({qc["ambiguous_fraction"]:.1%})</td></tr>'
+            '</table>'
+        )
+
+    # ── Near-duplicate warning ────────────────────────────────────────
+    near_dupes = rpt.get("near_dupes") or []
+    dup_block = ""
+    if near_dupes:
+        dup_rows = "".join(
+            f'<tr><td>{_h(a)}</td><td>{_h(b)}</td>'
+            f'<td style="background:{_sim_color(s)}">{s:.4f}</td></tr>'
+            for a, b, s in near_dupes[:20]
+        )
+        more = (f'<p style="font-size:.82rem;color:#888">'
+                f'… and {len(near_dupes) - 20} more</p>'
+                if len(near_dupes) > 20 else "")
+        dup_block = (
+            '<div style="background:#fff8e1;border:1px solid #ffe082;'
+            'border-radius:6px;padding:.8rem 1rem;margin:.8rem 0">'
+            f'<strong>\u26a0 Near-duplicate sequences:</strong> '
+            f'{len(near_dupes)} pair(s) above threshold'
+            '<table style="font-size:.85rem;width:auto;margin:.4rem 0">'
+            '<thead><tr><th>Sequence A</th><th>Sequence B</th>'
+            '<th>Similarity</th></tr></thead>'
+            f'<tbody>{dup_rows}</tbody></table>{more}</div>'
+        )
+
+    # ── Conservation plot (or text fallback) ──────────────────────────
     b64 = _conservation_plot_b64(
-        scores, f"Per-Position Conservation – {summary['file'].name}"
+        scores, f"Per-Position Conservation \u2013 {summary['file'].name}"
     )
+    entropy_data = rpt.get("entropy")
+    entropy_note = ""
+    if entropy_data:
+        mean_h  = sum(h for h, _ in entropy_data) / len(entropy_data)
+        mean_ic = sum(ic for _, ic in entropy_data) / len(entropy_data)
+        entropy_note = (
+            f'<p style="font-size:.88rem;margin-top:.3rem">'
+            f'Shannon entropy: mean <strong>{mean_h:.3f}</strong> bits &nbsp;·&nbsp; '
+            f'Information content: mean <strong>{mean_ic:.3f}</strong> bits</p>'
+        )
     if b64:
         cons_block = (
             '<h3>Per-Position Conservation</h3>'
             f'<img class="plot" src="data:image/png;base64,{b64}" '
             f'alt="Conservation plot">'
+            + entropy_note
         )
     elif scores:
         med = statistics.median(scores)
@@ -2780,6 +4549,7 @@ def _html_file_section(summary: dict, file_id: str,
             f'<p>median={med:.4f} &nbsp; min={min(scores):.4f} &nbsp; '
             f'max={max(scores):.4f} '
             f'<em>(install matplotlib for the plot)</em></p>'
+            + entropy_note
         )
     else:
         cons_block = ""
@@ -2791,19 +4561,27 @@ def _html_file_section(summary: dict, file_id: str,
 
     dend_block = ""
     dend_method = rpt.get("dendrogram_method", "average")
-    db64 = _dendrogram_b64(ids, sim_mat, method=dend_method)
+    dend_ids   = rpt.get("dend_ids", ids)
+    dend_sim   = rpt.get("dend_sim", sim_mat)
+    dend_title = rpt.get("dend_title")
+    db64 = _dendrogram_b64(dend_ids, dend_sim, method=dend_method,
+                           title=dend_title)
     if db64:
+        subtitle = (
+            "group-level \u00b7 between-group median similarity"
+            if dend_title else f"{_h(dend_method)} linkage"
+        )
         dend_block = (
             f'<h3>Hierarchical Clustering Dendrogram '
             f'<span style="font-weight:normal;font-size:.85em">'
-            f'({_h(dend_method)} linkage)</span></h3>'
+            f'({subtitle})</span></h3>'
             f'<img class="plot" src="data:image/png;base64,{db64}" '
             f'alt="Dendrogram">'
         )
 
     return (
         f'<div class="file-section">'
-        + header + meta
+        + header + meta_html + meta_block + qc_block + dup_block
         + _html_seq_table(records)
         + _html_sim_matrix(ids, sim_mat, off_mat, is_aligned)
         + cons_block
@@ -2858,10 +4636,15 @@ def _render_html_report(results: list[dict], args,
 <body>
 <h1>Protein Conservation Report</h1>
 <p class="meta">
+  prot_ction v{_h(VERSION)} &nbsp;·&nbsp;
   Generated: {run_date} &nbsp;·&nbsp;
+  Python {_h(sys.version.split()[0])} &nbsp;·&nbsp;
   {n_files} file(s) &nbsp;·&nbsp;
   Scoring: <strong>{_h(scoring_label)}</strong> &nbsp;·&nbsp;
   Mode: <strong>{_h(mode)}</strong>{rank_note}
+</p>
+<p class="meta" style="font-size:.78rem;color:#999">
+  Command: <code>{_h(" ".join(sys.argv))}</code>
 </p>
 {toc}
 <div id="summary"><h2>Summary</h2>
@@ -2929,24 +4712,53 @@ def _render_report(results: list[dict], args, report_arg: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+    args = parser.parse_args()
+
+    # ── handle --example ──────────────────────────────────────────────────
+    if getattr(args, "example", False):
+        example_path = _write_example_fasta()
+        print(f"Using built-in example dataset: {example_path}")
+        args.fasta = [example_path]
+    elif not args.fasta:
+        parser.print_help()
+        sys.exit(0)
+
+    # ── logging ───────────────────────────────────────────────────────────
+    logger = setup_logging(
+        verbose=getattr(args, "verbose", False),
+        log_file=getattr(args, "log_file", None),
+    )
+    logger.info("prot_ction v%s started", VERSION)
 
     # ── expand input paths ─────────────────────────────────────────────────
     input_files = expand_input_paths(args.fasta, recursive=args.recursive)
     if not input_files:
-        sys.exit("Error: no FASTA files found in the specified path(s).")
+        sys.exit("Error: no input files found in the specified path(s).")
 
     multi = len(input_files) > 1
     if multi:
-        print(f"Found {len(input_files)} FASTA file(s) to process.")
+        print(f"Found {len(input_files)} file(s) to process.")
+
+    # ── clear cache if requested ────────────────────────────────────────────
+    if getattr(args, "clear_cache", False) and args.cache_file:
+        cache_path = pathlib.Path(args.cache_file).expanduser()
+        if cache_path.exists():
+            cache_path.unlink()
+            print(f"Cache cleared: {cache_path}")
+        else:
+            print(f"Cache file not found (nothing to clear): {cache_path}")
 
     # ── shared taxonomy cache ──────────────────────────────────────────────
-    cache: TaxCache | None = None
+    cache: "TaxCache | None" = None
     if args.rank and not args.no_cache and args.cache_file:
         cache = TaxCache(args.cache_file)
 
     # ── out-dir ────────────────────────────────────────────────────────────
-    out_dir: pathlib.Path | None = None
+    out_dir: "pathlib.Path | None" = None
     if args.out_dir:
         out_dir = pathlib.Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -2955,13 +4767,14 @@ def main() -> None:
     results: list[dict] = []
     for idx, fasta_path in enumerate(input_files, 1):
         if multi:
-            bar = "━" * 70
+            bar = "\u2501" * 70
             print(f"\n{bar}")
             print(f"[{idx}/{len(input_files)}]  {fasta_path}")
             print(bar)
 
         stem   = fasta_path.stem
         parent = fasta_path.parent
+        file_timer = PhaseTimer()
 
         # Resolve output paths for this file
         out_matrix = _resolve_out_path(
@@ -2973,7 +4786,7 @@ def main() -> None:
         )
         rank_suffix = f"_rank_{args.rank}" if args.rank else "_rank"
         out_rank = _resolve_out_path(
-            args.out_rank_csv, stem, rank_suffix, ".csv", parent, out_dir, multi
+            args.out_rank_tsv, stem, rank_suffix, ".tsv", parent, out_dir, multi
         )
         heatmap = _resolve_heatmap_path(
             args.heatmap, stem, parent, out_dir, multi
@@ -2984,13 +4797,24 @@ def main() -> None:
         phyloxml_p = _resolve_out_path(
             args.out_phyloxml, stem, "_dendrogram", ".xml", parent, out_dir, multi
         )
+        newick_p = _resolve_out_path(
+            args.out_newick, stem, "_dendrogram", ".nwk", parent, out_dir, multi
+        )
+        violin_p = _resolve_out_path(
+            args.violin, stem, "_violin", ".pdf", parent, out_dir, multi
+        )
 
         summary = _analyse_fasta(
             args, fasta_path,
             out_matrix, out_cons, out_rank, heatmap, dendrogram_p, phyloxml_p,
-            cache,
+            newick_p, violin_p,
+            cache, logger=logger, timer=file_timer,
         )
         results.append(summary)
+
+        # Print timing summary when verbose or logging to file
+        if getattr(args, "verbose", False) or getattr(args, "log_file", None):
+            print(f"\nTiming:\n{file_timer.summary()}")
 
         if summary["error"] and not multi:
             sys.exit(f"Error: {summary['error']}")
@@ -2999,6 +4823,55 @@ def main() -> None:
     if multi:
         _print_multifile_summary(results, args.rank)
 
+    # ── focus-group cross-file output ────────────────────────────────────
+    if getattr(args, "focus_group", None) and args.rank and len(results) > 0:
+        fg = args.focus_group  # argparse converts --focus-group → args.focus_group
+        row_names, col_names, plabels, fg_matrix = _build_focus_matrix(results, fg)
+        # Also build the full distributional stats matrix
+        _rn2, _cn2, _pl2, fg_stats = _build_focus_full(results, fg)
+        if not row_names:
+            print(f"\n  Warning: focus group '{fg}' not found in any file at "
+                  f"rank '{args.rank}' – skipped.", file=sys.stderr)
+        else:
+            base = fg.replace(" ", "_")
+            fg_dir = out_dir if out_dir else pathlib.Path(".")
+            fg_tsv_path     = fg_dir / f"focus_{base}_{args.rank}.tsv"
+            fg_det_path     = fg_dir / f"focus_{base}_{args.rank}_detailed.tsv"
+            fg_pdf_path     = fg_dir / f"focus_{base}_{args.rank}_heatmap.pdf"
+            fg_violin_path  = fg_dir / f"focus_{base}_{args.rank}_violin.pdf"
+            # Summary TSV (median only)
+            try:
+                _guard(fg_tsv_path, args.overwrite)
+                _write_focus_tsv(fg_tsv_path, fg, args.rank,
+                                 row_names, col_names, plabels, fg_matrix)
+            except FileExistsError as exc:
+                print(f"  Skipped: {exc}", file=sys.stderr)
+            # Detailed TSV (full distributional stats)
+            if fg_stats:
+                try:
+                    _guard(fg_det_path, args.overwrite)
+                    _write_focus_detailed_tsv(fg_det_path, fg, args.rank,
+                                              row_names, col_names, plabels,
+                                              fg_stats)
+                except FileExistsError as exc:
+                    print(f"  Skipped: {exc}", file=sys.stderr)
+            # Heatmap (enhanced with IQR when stats available)
+            try:
+                _guard(fg_pdf_path, args.overwrite)
+                _plot_focus_heatmap(fg_pdf_path, fg, args.rank,
+                                    row_names, col_names, plabels, fg_matrix,
+                                    stats_matrix=fg_stats if fg_stats else None)
+            except FileExistsError as exc:
+                print(f"  Skipped: {exc}", file=sys.stderr)
+            # Violin + box plot (distribution view)
+            if fg_stats:
+                try:
+                    _guard(fg_violin_path, args.overwrite)
+                    _plot_focus_violin(fg_violin_path, fg, args.rank,
+                                       row_names, col_names, plabels, fg_stats)
+                except FileExistsError as exc:
+                    print(f"  Skipped: {exc}", file=sys.stderr)
+
     # ── HTML / PDF report ──────────────────────────────────────────────────
     if args.report:
         _render_report(results, args, args.report)
@@ -3006,6 +4879,8 @@ def main() -> None:
     # Flush cache once after all files
     if cache is not None:
         cache.save()
+
+    logger.info("prot_ction finished")
 
 
 if __name__ == "__main__":
