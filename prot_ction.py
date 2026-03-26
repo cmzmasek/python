@@ -26,7 +26,7 @@ Input: FASTA file with UniProt (sp|P12345|GENE_HUMAN) or GenBank (NP_000001.1)
 """
 from __future__ import annotations
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 import re
 import sys
@@ -49,6 +49,9 @@ from xml.etree import ElementTree as ET
 
 # Gap characters recognised in aligned sequences
 _GAP: frozenset[str] = frozenset("-.")
+
+# Module-level logger (reconfigured by setup_logging / _analyse_fasta)
+_log = logging.getLogger("prot_ction")
 
 # ---------------------------------------------------------------------------
 # Identifier parsing
@@ -3302,8 +3305,9 @@ def _plot_focus_heatmap(
     x_labels = []
     for stem, plabel in zip(col_names, protein_labels):
         if plabel and plabel != stem:
-            # Truncate long protein names for readability
-            short = plabel if len(plabel) <= 40 else plabel[:37] + "..."
+            # Strip "(+N others)" qualifier for cleaner heatmap labels
+            clean = re.sub(r"\s*\(\+\d+ others?\)$", "", plabel)
+            short = clean if len(clean) <= 40 else clean[:37] + "..."
             x_labels.append(f"{stem}\n({short})")
         else:
             x_labels.append(stem)
@@ -3506,7 +3510,9 @@ def _plot_focus_violin(
         # File label
         plabel = protein_labels[j]
         if plabel and plabel != col_names[j]:
-            short = plabel if len(plabel) <= 30 else plabel[:27] + "..."
+            # Strip "(+N others)" qualifier for cleaner labels
+            clean = re.sub(r"\s*\(\+\d+ others?\)$", "", plabel)
+            short = clean if len(clean) <= 30 else clean[:27] + "..."
             title = f"{col_names[j]}\n({short})"
         else:
             title = col_names[j]
