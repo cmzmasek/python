@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-BLASTP search program with taxonomy filtering.
+BLASTP search program with per-taxonomy search strategy.
 
 Takes a list of taxonomy names and a FASTA file of query protein sequences,
-runs BLASTP against NCBI, filters by E-value, query coverage, and percent
-identity, and writes a random selection of matching sequences to per-query
-FASTA output files.
+runs one BLASTP search per (query, taxonomy) pair against NCBI, filters by
+E-value, query coverage, and percent identity, and writes a random selection
+of matching sequences to per-query FASTA output files.
+
+Running one BLAST per taxonomy ensures that each taxon gets its own hit-list
+pool, preventing heavily-annotated species from crowding out rarer ones.
 
 Requirements:
     pip install biopython tqdm
@@ -18,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 from Bio import Entrez, SeqIO
 from Bio.Blast import NCBIWWW, NCBIXML
@@ -31,7 +34,7 @@ from tqdm import tqdm
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description=f"BLASTP search with taxonomy and quality filters (v{VERSION})",
+        description=f"BLASTP search with per-taxonomy filtering (v{VERSION})",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
@@ -76,11 +79,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--hitlist-size", type=int, default=500,
-        help="Number of BLAST hits to fetch before filtering (pool for random draw)",
-    )
-    p.add_argument(
-        "--keep-unmatched", action="store_true", default=False,
-        help="Include hits that do not match any specified taxonomy (grouped as '_other_')",
+        help="Number of BLAST hits to fetch per taxonomy (pool for random draw)",
     )
     p.add_argument(
         "--seed", type=int, default=None,
@@ -96,20 +95,32 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--resume", action="store_true", default=False,
-        help="Resume a previous run, skipping queries listed in checkpoint.txt",
+        help="Resume a previous run, skipping (query, taxonomy) pairs in checkpoint.txt",
     )
     if len(sys.argv) == 1:
         p.print_help()
         sys.exit(0)
     args = p.parse_args()
+
     # Merge taxonomies from -t and -T, deduplicate, preserve order
+    # taxonomy_max_seqs holds per-taxonomy -n overrides from the -T file
+    taxonomy_max_seqs: dict[str, int] = {}
     taxonomies = list(args.taxonomies) if args.taxonomies else []
     if args.taxonomy_file:
         with open(args.taxonomy_file) as fh:
             for line in fh:
-                name = line.strip()
-                if name and not name.startswith("#"):
-                    taxonomies.append(name)
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                name = parts[0].strip()
+                if len(parts) >= 2:
+                    try:
+                        taxonomy_max_seqs[name] = int(parts[1].strip())
+                    except ValueError:
+                        pass
+                taxonomies.append(name)
+    args.taxonomy_max_seqs = taxonomy_max_seqs
     seen: set[str] = set()
     args.taxonomies = [t for t in taxonomies if not (t in seen or seen.add(t))]
     if not args.taxonomies:
@@ -149,9 +160,9 @@ def load_checkpoint(path: Path) -> set[str]:
     return {line.strip() for line in path.read_text().splitlines() if line.strip()}
 
 
-def save_checkpoint(path: Path, query_id: str) -> None:
+def save_checkpoint(path: Path, key: str) -> None:
     with open(path, "a") as fh:
-        fh.write(query_id + "\n")
+        fh.write(key + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -215,24 +226,15 @@ def resolve_taxonomies(taxonomies: list[str], max_retries: int,
     return resolved
 
 
+def build_entrez_query(info: dict) -> str:
+    """Build a single-taxonomy Entrez query for BLAST."""
+    org_name = info["scientific_name"]
+    return f'"{org_name}"[Organism]'
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def build_entrez_query(resolved: dict[str, dict]) -> str:
-    """
-    Build an Entrez query string for BLAST using organism names.
-    Uses the canonical scientific name when TaxID resolution succeeded,
-    otherwise falls back to the user-supplied name.
-    Note: BLAST's entrez_query parameter uses [Organism] name syntax,
-    not TaxID syntax — TaxIDs are used only for client-side grouping.
-    """
-    parts = []
-    for name, info in resolved.items():
-        org_name = info["scientific_name"]
-        parts.append(f'"{org_name}"[Organism]')
-    return " OR ".join(parts)
-
 
 def trim_description(title: str, max_len: int = 120) -> str:
     """Keep only the first entry of a MULTISPECIES title and cap length."""
@@ -290,7 +292,7 @@ def extract_accession(raw: str) -> str:
 def run_blastp(seq: str, entrez_query: str, evalue: float, hitlist_size: int,
                db: str, max_retries: int, retry_delay: float):
     """Submit a BLASTP query to NCBI and return parsed BLAST records."""
-    with tqdm(bar_format="  {desc} {elapsed}", desc="Waiting for BLAST...", leave=False) as pbar:
+    with tqdm(bar_format="  {desc} {elapsed}", desc="  Waiting for BLAST...", leave=False) as pbar:
         result_handle = retry_call(
             NCBIWWW.qblast,
             "blastp", db, seq,
@@ -303,7 +305,7 @@ def run_blastp(seq: str, entrez_query: str, evalue: float, hitlist_size: int,
             base_delay=retry_delay,
             label="BLASTP",
         )
-        pbar.set_description("BLAST complete")
+        pbar.set_description("  BLAST complete")
     records = list(NCBIXML.parse(result_handle))
     result_handle.close()
     return records
@@ -340,7 +342,6 @@ def filter_hits(blast_record, evalue_cutoff: float, coverage_cutoff: float,
 
         passing.append({
             "accession": acc,
-            "raw_accession": alignment.accession,
             "title": alignment.title,
             "evalue": best_hsp.expect,
             "coverage": round(cov, 1),
@@ -383,41 +384,6 @@ def fetch_sequences(accessions: list[str], max_retries: int, retry_delay: float,
     return sequences
 
 
-def assign_taxonomy(hit: dict, resolved: dict[str, dict]) -> str:
-    """
-    Assign a hit to a taxonomy group by checking the canonical scientific name
-    (from TaxID resolution) and the user-supplied name against the hit title.
-    Falls back to '_other_' if no match.
-    """
-    title_lower = hit["title"].lower()
-    for name, info in resolved.items():
-        canonical = info["scientific_name"].lower()
-        if canonical in title_lower or name.lower() in title_lower:
-            return name
-    return "_other_"
-
-
-def group_and_sample(passing: list[dict], resolved: dict[str, dict],
-                     max_seqs: int, keep_unmatched: bool = False) -> list[dict]:
-    """Group hits by taxonomy and randomly draw up to max_seqs from each."""
-    groups: dict[str, list[dict]] = {}
-    for hit in passing:
-        tax = assign_taxonomy(hit, resolved)
-        groups.setdefault(tax, []).append(hit)
-
-    selected: list[dict] = []
-    for tax, hits in groups.items():
-        if tax == "_other_" and not keep_unmatched:
-            tqdm.write(
-                f"  [_other_] passing={len(hits)}, skipped (use --keep-unmatched to include)"
-            )
-            continue
-        draw = random.sample(hits, min(max_seqs, len(hits)))
-        selected.extend(draw)
-        tqdm.write(f"  [{tax}] passing={len(hits)}, selected={len(draw)}")
-    return selected
-
-
 def match_sequence(acc: str, sequences: dict):
     """
     Look up a sequence by accession, tolerating partial matches
@@ -448,8 +414,7 @@ def main() -> None:
     checkpoint_path = outdir / "checkpoint.txt"
     completed = load_checkpoint(checkpoint_path) if args.resume else set()
     if completed:
-        print(f"Resuming: {len(completed)} quer{'y' if len(completed) == 1 else 'ies'} "
-              f"already completed, skipping.")
+        print(f"Resuming: {len(completed)} (query, taxonomy) pair(s) already done, skipping.")
 
     # Load query sequences
     query_records = list(SeqIO.parse(args.query, "fasta"))
@@ -458,25 +423,25 @@ def main() -> None:
 
     # Resolve taxonomy names to TaxIDs and canonical names
     resolved = resolve_taxonomies(args.taxonomies, args.max_retries, args.retry_delay)
-    entrez_query = build_entrez_query(resolved)
 
     tsv_path = outdir / "summary.tsv"
     tsv_columns = [
         "query_id", "query_length", "taxonomy", "accession", "description",
         "evalue", "identity_pct", "query_coverage_pct", "output_fasta",
     ]
-    # On resume, append to existing TSV without re-writing the header
     tsv_mode = "a" if (args.resume and tsv_path.exists()) else "w"
 
-    print(f"Queries      : {len(query_records)}")
-    print(f"Taxonomies   : {', '.join(args.taxonomies)}")
-    print(f"E-value      : {args.evalue}")
-    print(f"Coverage     : {args.coverage}%")
-    print(f"Identity     : {args.identity}%")
-    print(f"Max seqs/tax : {args.max_seqs}")
-    print(f"BLAST pool   : {args.hitlist_size} hits")
-    print(f"Output dir   : {outdir}")
-    print(f"Summary TSV  : {tsv_path}")
+    total_pairs = len(query_records) * len(resolved)
+    print(f"Queries       : {len(query_records)}")
+    print(f"Taxonomies    : {len(resolved)}  ({', '.join(args.taxonomies)})")
+    print(f"BLAST calls   : {total_pairs}  (one per query × taxonomy)")
+    print(f"E-value       : {args.evalue}")
+    print(f"Coverage      : {args.coverage}%")
+    print(f"Identity      : {args.identity}%")
+    print(f"Max seqs/tax  : {args.max_seqs}")
+    print(f"BLAST pool    : {args.hitlist_size} hits per search")
+    print(f"Output dir    : {outdir}")
+    print(f"Summary TSV   : {tsv_path}")
     print()
 
     with open(tsv_path, tsv_mode, newline="") as tsv_fh:
@@ -484,97 +449,117 @@ def main() -> None:
         if tsv_mode == "w":
             writer.writeheader()
 
-        pending = [r for r in query_records if r.id not in completed]
-        query_bar = tqdm(pending, desc="Queries", unit="query")
+        query_bar = tqdm(query_records, desc="Queries", unit="query")
         for qrec in query_bar:
             qid = qrec.id
             qlen = len(qrec.seq)
             query_bar.set_description(f"Query: {qid}")
-            tqdm.write(f"\n=== Query: {qid} ({qlen} aa) ===")
 
-            # 1. BLAST
-            try:
-                blast_records = run_blastp(
-                    str(qrec.seq), entrez_query, args.evalue,
-                    args.hitlist_size, args.db, args.max_retries, args.retry_delay,
-                )
-            except Exception as exc:
-                tqdm.write(f"  [error] BLAST failed after retries: {exc}", file=sys.stderr)
+            # Skip query entirely if all its (query, taxonomy) pairs are done
+            pending_taxes = [
+                name for name in resolved
+                if f"{qid}::{name}" not in completed
+            ]
+            if not pending_taxes:
+                tqdm.write(f"\n=== Query: {qid} — all taxonomies done, skipping ===")
                 continue
 
-            if not blast_records or not blast_records[0].alignments:
-                tqdm.write("  No BLAST hits returned.")
-                save_checkpoint(checkpoint_path, qid)
-                continue
+            tqdm.write(f"\n=== Query: {qid} ({qlen} aa) | {len(pending_taxes)} taxonomy search(es) ===")
 
-            # 2. Filter
-            passing = filter_hits(
-                blast_records[0], args.evalue, args.coverage, args.identity, qlen,
-            )
-            tqdm.write(f"  Hits passing filters : {len(passing)}")
-
-            if not passing:
-                tqdm.write("  Nothing to write.")
-                save_checkpoint(checkpoint_path, qid)
-                continue
-
-            # 3. Per-taxonomy random draw
-            selected = group_and_sample(passing, resolved, args.max_seqs,
-                                        keep_unmatched=args.keep_unmatched)
-            tqdm.write(f"  Total selected       : {len(selected)}")
-
-            # 4. Fetch sequences
-            accessions = [h["accession"] for h in selected]
-            sequences = fetch_sequences(accessions, args.max_retries, args.retry_delay)
-
-            # 5. Write FASTA and TSV rows
             out_path = outdir / f"{safe_filename(qid)}.fasta"
-            written = 0
-            with open(out_path, "w") as fh:
-                for hit in tqdm(selected, desc="  Writing sequences", unit="seq", leave=False):
-                    tax = assign_taxonomy(hit, resolved)
-                    rec = match_sequence(hit["accession"], sequences)
-                    if rec is None:
-                        tqdm.write(
-                            f"  [warning] Sequence not fetched: {hit['accession']}",
-                            file=sys.stderr,
+            # Append to FASTA if it already has content from a previous (resumed) run
+            fasta_has_content = out_path.exists() and out_path.stat().st_size > 0
+
+            for tax_name in pending_taxes:
+                tax_info = resolved[tax_name]
+                checkpoint_key = f"{qid}::{tax_name}"
+                entrez_q = build_entrez_query(tax_info)
+
+                tqdm.write(f"  --- Taxonomy: {tax_name} ---")
+
+                # 1. BLAST (scoped to this taxonomy only)
+                try:
+                    blast_records = run_blastp(
+                        str(qrec.seq), entrez_q, args.evalue,
+                        args.hitlist_size, args.db, args.max_retries, args.retry_delay,
+                    )
+                except Exception as exc:
+                    tqdm.write(f"  [error] BLAST failed after retries: {exc}", file=sys.stderr)
+                    continue
+
+                if not blast_records or not blast_records[0].alignments:
+                    tqdm.write("  No BLAST hits returned.")
+                    save_checkpoint(checkpoint_path, checkpoint_key)
+                    continue
+
+                # 2. Filter
+                passing = filter_hits(
+                    blast_records[0], args.evalue, args.coverage, args.identity, qlen,
+                )
+                tqdm.write(f"  Hits passing filters : {len(passing)}")
+
+                if not passing:
+                    tqdm.write("  Nothing to write.")
+                    save_checkpoint(checkpoint_path, checkpoint_key)
+                    continue
+
+                # 3. Random draw (up to max_seqs from this taxonomy's pool)
+                max_seqs = args.taxonomy_max_seqs.get(tax_name, args.max_seqs)
+                selected = random.sample(passing, min(max_seqs, len(passing)))
+                tqdm.write(f"  Selected             : {len(selected)}")
+
+                # 4. Fetch sequences
+                accessions = [h["accession"] for h in selected]
+                sequences = fetch_sequences(accessions, args.max_retries, args.retry_delay)
+
+                # 5. Write FASTA and TSV rows
+                fasta_mode = "a" if fasta_has_content else "w"
+                written = 0
+                with open(out_path, fasta_mode) as fh:
+                    for hit in tqdm(selected, desc="  Writing", unit="seq", leave=False):
+                        rec = match_sequence(hit["accession"], sequences)
+                        if rec is None:
+                            tqdm.write(
+                                f"  [warning] Sequence not fetched: {hit['accession']}",
+                                file=sys.stderr,
+                            )
+                            writer.writerow({
+                                "query_id": qid,
+                                "query_length": qlen,
+                                "taxonomy": tax_name,
+                                "accession": hit["accession"],
+                                "description": trim_description(hit["title"]),
+                                "evalue": f"{hit['evalue']:.2e}",
+                                "identity_pct": hit["identity"],
+                                "query_coverage_pct": hit["coverage"],
+                                "output_fasta": "NOT_FETCHED",
+                            })
+                            continue
+                        rec.description = (
+                            f"evalue={hit['evalue']:.2e} "
+                            f"id={hit['identity']}% "
+                            f"qcov={hit['coverage']}% | {rec.description}"
                         )
+                        SeqIO.write(rec, fh, "fasta")
                         writer.writerow({
                             "query_id": qid,
                             "query_length": qlen,
-                            "taxonomy": tax,
+                            "taxonomy": tax_name,
                             "accession": hit["accession"],
                             "description": trim_description(hit["title"]),
                             "evalue": f"{hit['evalue']:.2e}",
                             "identity_pct": hit["identity"],
                             "query_coverage_pct": hit["coverage"],
-                            "output_fasta": "NOT_FETCHED",
+                            "output_fasta": str(out_path),
                         })
-                        continue
-                    rec.description = (
-                        f"evalue={hit['evalue']:.2e} "
-                        f"id={hit['identity']}% "
-                        f"qcov={hit['coverage']}% | {rec.description}"
-                    )
-                    SeqIO.write(rec, fh, "fasta")
-                    writer.writerow({
-                        "query_id": qid,
-                        "query_length": qlen,
-                        "taxonomy": tax,
-                        "accession": hit["accession"],
-                        "description": trim_description(hit["title"]),
-                        "evalue": f"{hit['evalue']:.2e}",
-                        "identity_pct": hit["identity"],
-                        "query_coverage_pct": hit["coverage"],
-                        "output_fasta": str(out_path),
-                    })
-                    written += 1
+                        written += 1
 
-            tqdm.write(f"  Written {written} sequences -> {out_path}")
-            save_checkpoint(checkpoint_path, qid)
-            time.sleep(1)
+                tqdm.write(f"  Written {written} sequences -> {out_path}")
+                fasta_has_content = True
+                save_checkpoint(checkpoint_path, checkpoint_key)
+                time.sleep(1)
 
-    print(f"Summary written -> {tsv_path}")
+    print(f"\nSummary written -> {tsv_path}")
     print("Done.")
 
 
