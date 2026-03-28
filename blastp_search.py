@@ -29,8 +29,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Optional
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 
 from Bio import Entrez, SeqIO
 from Bio.Blast import NCBIWWW, NCBIXML
@@ -64,6 +65,11 @@ def parse_args() -> argparse.Namespace:
         help="Your e-mail address (required by NCBI)",
     )
     p.add_argument(
+        "--api-key", default=None, metavar="KEY",
+        help="NCBI API key (raises rate limit from 3 to 10 req/s; register at "
+             "https://www.ncbi.nlm.nih.gov/account/)",
+    )
+    p.add_argument(
         "-e", "--evalue", type=float, default=1e-5,
         help="Maximum E-value cutoff",
     )
@@ -93,7 +99,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--workers", type=int, default=3,
-        help="Number of taxonomy BLAST searches to run in parallel per query",
+        help="Number of taxonomy BLAST searches to run in parallel per query "
+             "(with --api-key you can safely raise this to 10)",
     )
     p.add_argument(
         "--no-cache", action="store_true", default=False,
@@ -120,6 +127,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--resume", action="store_true", default=False,
         help="Resume a previous run, skipping (query, taxonomy) pairs in checkpoint.txt",
+    )
+    p.add_argument(
+        "--hit-counts", metavar="FILE", default=None,
+        help="Write a continuously updated TSV matrix of hit counts "
+             "(rows = taxonomies, columns = query sequences)",
     )
     p.add_argument(
         "--no-multispecies", action="store_true", default=False,
@@ -366,13 +378,13 @@ def _blast_cache_key(seq: str, entrez_query: str, evalue: float,
 
 def run_blastp(seq: str, entrez_query: str, evalue: float, hitlist_size: int,
                db: str, max_retries: int, retry_delay: float,
-               cache_dir: Path | None = None):
+               cache_dir: Optional[Path] = None):
     """
     Submit a BLASTP query to NCBI and return parsed BLAST records.
     If cache_dir is set, check for a cached XML file first and save new
     results to the cache.
     """
-    cache_file: Path | None = None
+    cache_file: Optional[Path] = None
     if cache_dir is not None:
         key = _blast_cache_key(seq, entrez_query, evalue, hitlist_size, db)
         cache_file = cache_dir / f"{key}.xml"
@@ -517,7 +529,7 @@ def process_taxonomy(
     tax_name: str,
     tax_info: dict,
     args,
-    cache_dir: Path | None,
+    cache_dir: Optional[Path],
     rng: random.Random,
 ) -> tuple[str, list[tuple]]:
     """
@@ -566,12 +578,28 @@ def process_taxonomy(
 
 
 # ---------------------------------------------------------------------------
+# Hit-count matrix
+# ---------------------------------------------------------------------------
+
+def write_hit_counts(path: Path, counts: dict, query_ids: list, tax_names: list) -> None:
+    """Rewrite the hit-counts matrix TSV (rows = taxa, columns = queries)."""
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh, delimiter="\t")
+        writer.writerow(["taxonomy"] + query_ids)
+        for tax in tax_names:
+            row = [tax] + [counts.get(tax, {}).get(qid, "") for qid in query_ids]
+            writer.writerow(row)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     args = parse_args()
     Entrez.email = args.email
+    if args.api_key:
+        Entrez.api_key = args.api_key
 
     base_seed = args.seed
 
@@ -579,7 +607,7 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     # Set up cache directory
-    cache_dir: Path | None = None
+    cache_dir: Optional[Path] = None
     if not args.no_cache:
         cache_dir = Path(args.cache_dir) if args.cache_dir else outdir / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -597,6 +625,9 @@ def main() -> None:
     # Resolve taxonomy names to TaxIDs and canonical names
     resolved = resolve_taxonomies(args.taxonomies, args.max_retries, args.retry_delay)
 
+    query_ids = [rec.id for rec in query_records]
+    hit_counts: dict = {tax: {} for tax in args.taxonomies}
+
     tsv_path = outdir / "summary.tsv"
     tsv_columns = [
         "query_id", "query_length", "taxonomy", "accession", "description",
@@ -609,6 +640,7 @@ def main() -> None:
     print(f"Taxonomies    : {len(resolved)}  ({', '.join(args.taxonomies)})")
     print(f"BLAST calls   : {total_pairs}  (one per query × taxonomy)")
     print(f"Workers       : {args.workers}  (parallel taxonomy searches per query)")
+    print(f"NCBI API key  : {'yes' if args.api_key else 'no (max 3 req/s)'}")
     print(f"Cache         : {'disabled' if cache_dir is None else str(cache_dir)}")
     print(f"E-value       : {args.evalue}")
     print(f"Coverage      : {args.coverage}%")
@@ -617,6 +649,7 @@ def main() -> None:
     print(f"BLAST pool    : {args.hitlist_size} hits per search")
     print(f"Output dir    : {outdir}")
     print(f"Summary TSV   : {tsv_path}")
+    print(f"Hit counts    : {args.hit_counts or 'disabled'}")
     print()
 
     write_lock = threading.Lock()
@@ -725,6 +758,11 @@ def main() -> None:
                                 written += 1
                         tsv_fh.flush()
                         save_checkpoint(checkpoint_path, checkpoint_key)
+                        hit_counts[tax_name][qid] = len(results)
+                        if args.hit_counts:
+                            write_hit_counts(
+                                Path(args.hit_counts), hit_counts, query_ids, args.taxonomies,
+                            )
                         tqdm.write(f"  [{tax_name}] written {written} sequences -> {out_path}")
 
                     tax_bar.update(1)
@@ -732,6 +770,8 @@ def main() -> None:
                 tax_bar.close()
 
     print(f"\nSummary written -> {tsv_path}")
+    if args.hit_counts:
+        print(f"Hit counts written -> {args.hit_counts}")
     print("Done.")
 
 
