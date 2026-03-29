@@ -24,14 +24,16 @@ import hashlib
 import io
 import re
 import random
+import socket
+import statistics
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Optional
 
-VERSION = "1.3.0"
+VERSION = "1.5.0"
 
 from Bio import Entrez, SeqIO
 from Bio.Blast import NCBIWWW, NCBIXML
@@ -125,6 +127,14 @@ def parse_args() -> argparse.Namespace:
         help="Base delay in seconds between retries (doubles each attempt)",
     )
     p.add_argument(
+        "--blast-timeout", type=int, default=300,
+        help="Socket timeout in seconds for NCBI connections (prevents silent hangs)",
+    )
+    p.add_argument(
+        "--search-timeout", type=int, default=1200,
+        help="Maximum total time in seconds allowed per BLAST search before retrying (default: 1200 = 20 min)",
+    )
+    p.add_argument(
         "--resume", action="store_true", default=False,
         help="Resume a previous run, skipping (query, taxonomy) pairs in checkpoint.txt",
     )
@@ -132,6 +142,17 @@ def parse_args() -> argparse.Namespace:
         "--hit-counts", metavar="FILE", default=None,
         help="Write a continuously updated TSV matrix of hit counts "
              "(rows = taxonomies, columns = query sequences)",
+    )
+    p.add_argument(
+        "--selected-hit-median-identity", metavar="FILE", default=None,
+        help="Write a continuously updated TSV matrix of median percent identity "
+             "of the selected hits (rows = taxonomies, columns = query sequences)",
+    )
+    p.add_argument(
+        "--selected-hit-stats", metavar="FILE", default=None,
+        help="Write a continuously updated TSV matrix of descriptive statistics "
+             "(E-value range, identity range+mean, coverage range+mean) for the "
+             "selected hits (rows = taxonomies, columns = query sequences)",
     )
     p.add_argument(
         "--no-multispecies", action="store_true", default=False,
@@ -378,7 +399,7 @@ def _blast_cache_key(seq: str, entrez_query: str, evalue: float,
 
 def run_blastp(seq: str, entrez_query: str, evalue: float, hitlist_size: int,
                db: str, max_retries: int, retry_delay: float,
-               cache_dir: Optional[Path] = None):
+               cache_dir: Optional[Path] = None, search_timeout: int = 1200):
     """
     Submit a BLASTP query to NCBI and return parsed BLAST records.
     If cache_dir is set, check for a cached XML file first and save new
@@ -393,20 +414,42 @@ def run_blastp(seq: str, entrez_query: str, evalue: float, hitlist_size: int,
             xml_str = cache_file.read_text()
             return list(NCBIXML.parse(io.StringIO(xml_str)))
 
-    result_handle = retry_call(
-        NCBIWWW.qblast,
-        "blastp", db, seq,
-        entrez_query=entrez_query,
-        expect=evalue,
-        hitlist_size=hitlist_size,
-        alignments=hitlist_size,
-        descriptions=hitlist_size,
+    def _qblast():
+        handle = NCBIWWW.qblast(
+            "blastp", db, seq,
+            entrez_query=entrez_query,
+            expect=evalue,
+            hitlist_size=hitlist_size,
+            alignments=hitlist_size,
+            descriptions=hitlist_size,
+        )
+        xml = handle.read()
+        handle.close()
+        # NCBI errors are returned as HTML/plain-text inside the handle instead
+        # of raising — detect them here so retry_call can back off and retry.
+        if "Error message from NCBI" in xml or "error code:" in xml.lower():
+            raise RuntimeError(f"NCBI error response: {xml[:200].strip()}")
+        return xml
+
+    def _qblast_with_timeout():
+        ex = ThreadPoolExecutor(max_workers=1)
+        future = ex.submit(_qblast)
+        try:
+            result = future.result(timeout=search_timeout)
+            ex.shutdown(wait=False)
+            return result
+        except FutureTimeoutError:
+            ex.shutdown(wait=False)
+            raise RuntimeError(
+                f"BLAST search exceeded {search_timeout}s total time limit"
+            )
+
+    xml_str = retry_call(
+        _qblast_with_timeout,
         max_attempts=max_retries,
         base_delay=retry_delay,
         label="BLASTP",
     )
-    xml_str = result_handle.read()
-    result_handle.close()
 
     if cache_file is not None:
         cache_file.write_text(xml_str)
@@ -531,30 +574,34 @@ def process_taxonomy(
     args,
     cache_dir: Optional[Path],
     rng: random.Random,
-) -> tuple[str, list[tuple]]:
+) -> tuple[str, list[tuple], int]:
     """
     Run BLAST, filter, and fetch sequences for one (query, taxonomy) pair.
-    Returns (tax_name, [(hit_dict, SeqRecord_or_None), ...]).
+    Returns (tax_name, [(hit_dict, SeqRecord_or_None), ...], n_passing).
+    n_passing is the count of hits passing all filters (before random draw).
     Called from worker threads.
     """
     entrez_q = build_entrez_query(tax_info)
     qlen = len(qrec.seq)
 
+    jitter = rng.uniform(2.0, 5.0)
+    tqdm.write(f"  [{tax_name}] waiting {jitter:.1f}s before BLAST...")
+    time.sleep(jitter)
     tqdm.write(f"  [{tax_name}] starting BLAST...")
 
     try:
         blast_records = run_blastp(
             str(qrec.seq), entrez_q, args.evalue,
             args.hitlist_size, args.db, args.max_retries, args.retry_delay,
-            cache_dir=cache_dir,
+            cache_dir=cache_dir, search_timeout=args.search_timeout,
         )
     except Exception as exc:
         tqdm.write(f"  [{tax_name}] BLAST failed after retries: {exc}", file=sys.stderr)
-        return tax_name, []
+        return tax_name, [], 0
 
     if not blast_records or not blast_records[0].alignments:
         tqdm.write(f"  [{tax_name}] no BLAST hits returned")
-        return tax_name, []
+        return tax_name, [], 0
 
     passing = filter_hits(
         blast_records[0], args.evalue, args.coverage, args.identity, qlen,
@@ -563,7 +610,7 @@ def process_taxonomy(
     tqdm.write(f"  [{tax_name}] hits passing filters: {len(passing)}")
 
     if not passing:
-        return tax_name, []
+        return tax_name, [], 0
 
     max_seqs = args.taxonomy_max_seqs.get(tax_name, args.max_seqs)
     selected = rng.sample(passing, min(max_seqs, len(passing)))
@@ -574,7 +621,7 @@ def process_taxonomy(
     )
 
     results = [(hit, match_sequence(hit["accession"], sequences)) for hit in selected]
-    return tax_name, results
+    return tax_name, results, len(passing)
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +638,49 @@ def write_hit_counts(path: Path, counts: dict, query_ids: list, tax_names: list)
             writer.writerow(row)
 
 
+def write_median_identity(path: Path, medians: dict, query_ids: list, tax_names: list) -> None:
+    """Rewrite the median-identity matrix TSV (rows = taxa, columns = queries)."""
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh, delimiter="\t")
+        writer.writerow(["taxonomy"] + query_ids)
+        for tax in tax_names:
+            row = [tax] + [medians.get(tax, {}).get(qid, "") for qid in query_ids]
+            writer.writerow(row)
+
+
+def format_hit_stats(results: list) -> str:
+    """
+    Format descriptive statistics for the selected hits as a compact string.
+    Example: 'n=5 E:1.2e-08–3.5e-06 id:80.0–95.3%(avg:87.1%) cov:88.0–100.0%(avg:94.2%)'
+    """
+    if not results:
+        return "n=0"
+    evalues   = [hit["evalue"]   for hit, _ in results]
+    ids       = [hit["identity"] for hit, _ in results]
+    coverages = [hit["coverage"] for hit, _ in results]
+    e_min, e_max     = min(evalues),   max(evalues)
+    id_min, id_max   = min(ids),       max(ids)
+    cov_min, cov_max = min(coverages), max(coverages)
+    id_median = round(statistics.median(ids),       1)
+    cov_mean  = round(sum(coverages) / len(coverages), 1)
+    return (
+        f"n={len(results)} "
+        f"E:{e_min:.1e}\u2013{e_max:.1e} "
+        f"id:{id_min}\u2013{id_max}%(med:{id_median}%) "
+        f"cov:{cov_min}\u2013{cov_max}%(avg:{cov_mean}%)"
+    )
+
+
+def write_hit_stats(path: Path, stats: dict, query_ids: list, tax_names: list) -> None:
+    """Rewrite the hit-stats matrix TSV (rows = taxa, columns = queries)."""
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh, delimiter="\t")
+        writer.writerow(["taxonomy"] + query_ids)
+        for tax in tax_names:
+            row = [tax] + [stats.get(tax, {}).get(qid, "") for qid in query_ids]
+            writer.writerow(row)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -600,6 +690,7 @@ def main() -> None:
     Entrez.email = args.email
     if args.api_key:
         Entrez.api_key = args.api_key
+    socket.setdefaulttimeout(args.blast_timeout)
 
     base_seed = args.seed
 
@@ -627,6 +718,8 @@ def main() -> None:
 
     query_ids = [rec.id for rec in query_records]
     hit_counts: dict = {tax: {} for tax in args.taxonomies}
+    median_identity: dict = {tax: {} for tax in args.taxonomies}
+    hit_stats: dict = {tax: {} for tax in args.taxonomies}
 
     tsv_path = outdir / "summary.tsv"
     tsv_columns = [
@@ -641,6 +734,7 @@ def main() -> None:
     print(f"BLAST calls   : {total_pairs}  (one per query × taxonomy)")
     print(f"Workers       : {args.workers}  (parallel taxonomy searches per query)")
     print(f"NCBI API key  : {'yes' if args.api_key else 'no (max 3 req/s)'}")
+    print(f"BLAST timeout : {args.blast_timeout}s (socket) / {args.search_timeout}s (per search)")
     print(f"Cache         : {'disabled' if cache_dir is None else str(cache_dir)}")
     print(f"E-value       : {args.evalue}")
     print(f"Coverage      : {args.coverage}%")
@@ -650,6 +744,8 @@ def main() -> None:
     print(f"Output dir    : {outdir}")
     print(f"Summary TSV   : {tsv_path}")
     print(f"Hit counts    : {args.hit_counts or 'disabled'}")
+    print(f"Median id     : {args.selected_hit_median_identity or 'disabled'}")
+    print(f"Hit stats     : {args.selected_hit_stats or 'disabled'}")
     print()
 
     write_lock = threading.Lock()
@@ -709,7 +805,7 @@ def main() -> None:
                     tax_name = futures[future]
                     checkpoint_key = f"{qid}::{tax_name}"
                     try:
-                        _, results = future.result()
+                        _, results, n_passing = future.result()
                     except Exception as exc:
                         tqdm.write(f"  [{tax_name}] unexpected error: {exc}", file=sys.stderr)
                         tax_bar.update(1)
@@ -758,10 +854,26 @@ def main() -> None:
                                 written += 1
                         tsv_fh.flush()
                         save_checkpoint(checkpoint_path, checkpoint_key)
-                        hit_counts[tax_name][qid] = len(results)
+                        hit_counts[tax_name][qid] = n_passing
                         if args.hit_counts:
                             write_hit_counts(
                                 Path(args.hit_counts), hit_counts, query_ids, args.taxonomies,
+                            )
+                        identities = [hit["identity"] for hit, _ in results]
+                        if identities:
+                            median_identity[tax_name][qid] = round(statistics.median(identities), 1)
+                        else:
+                            median_identity[tax_name][qid] = 0
+                        if args.selected_hit_median_identity:
+                            write_median_identity(
+                                Path(args.selected_hit_median_identity),
+                                median_identity, query_ids, args.taxonomies,
+                            )
+                        hit_stats[tax_name][qid] = format_hit_stats(results)
+                        if args.selected_hit_stats:
+                            write_hit_stats(
+                                Path(args.selected_hit_stats),
+                                hit_stats, query_ids, args.taxonomies,
                             )
                         tqdm.write(f"  [{tax_name}] written {written} sequences -> {out_path}")
 
@@ -772,6 +884,10 @@ def main() -> None:
     print(f"\nSummary written -> {tsv_path}")
     if args.hit_counts:
         print(f"Hit counts written -> {args.hit_counts}")
+    if args.selected_hit_median_identity:
+        print(f"Median identity written -> {args.selected_hit_median_identity}")
+    if args.selected_hit_stats:
+        print(f"Hit stats written -> {args.selected_hit_stats}")
     print("Done.")
 
 
