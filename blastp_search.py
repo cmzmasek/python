@@ -19,6 +19,7 @@ Requirements:
 """
 
 import argparse
+import collections
 import csv
 import hashlib
 import io
@@ -33,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 from pathlib import Path
 from typing import Optional
 
-VERSION = "1.5.0"
+VERSION = "1.6.1"
 
 from Bio import Entrez, SeqIO
 from Bio.Blast import NCBIWWW, NCBIXML
@@ -155,6 +156,11 @@ def parse_args() -> argparse.Namespace:
              "selected hits (rows = taxonomies, columns = query sequences)",
     )
     p.add_argument(
+        "--selected-hit-majority-name", metavar="FILE", default=None,
+        help="Write a continuously updated TSV matrix of the majority protein name "
+             "among the selected hits (rows = taxonomies, columns = query sequences)",
+    )
+    p.add_argument(
         "--no-multispecies", action="store_true", default=False,
         help="Exclude hits whose title contains 'MULTISPECIES'",
     )
@@ -233,8 +239,8 @@ def save_checkpoint(path: Path, key: str) -> None:
 def resolve_taxonomies(taxonomies: list[str], max_retries: int,
                        retry_delay: float) -> dict[str, dict]:
     """
-    Resolve taxonomy names to NCBI TaxIDs and canonical scientific names.
-    Returns {user_name: {"taxid": str|None, "scientific_name": str}}.
+    Resolve taxonomy names to NCBI TaxIDs, canonical scientific names, and lineages.
+    Returns {user_name: {"taxid": str|None, "scientific_name": str, "lineage": str}}.
     """
     resolved: dict[str, dict] = {}
     print("Resolving taxonomy names via NCBI...")
@@ -250,12 +256,12 @@ def resolve_taxonomies(taxonomies: list[str], max_retries: int,
             ids = record["IdList"]
         except Exception as exc:
             tqdm.write(f"  [warning] TaxID lookup failed for '{name}': {exc}", file=sys.stderr)
-            resolved[name] = {"taxid": None, "scientific_name": name}
+            resolved[name] = {"taxid": None, "scientific_name": name, "lineage": name}
             continue
 
         if not ids:
             tqdm.write(f"  [warning] No TaxID found for '{name}', using as-is", file=sys.stderr)
-            resolved[name] = {"taxid": None, "scientific_name": name}
+            resolved[name] = {"taxid": None, "scientific_name": name, "lineage": name}
             continue
 
         if len(ids) > 1:
@@ -274,12 +280,16 @@ def resolve_taxonomies(taxonomies: list[str], max_retries: int,
             tax_records = Entrez.read(handle)
             handle.close()
             sci_name = tax_records[0]["ScientificName"]
+            lineage_raw = tax_records[0].get("Lineage", "")
+            lineage = (lineage_raw.replace("; ", " > ") + " > " + sci_name
+                       if lineage_raw else sci_name)
         except Exception as exc:
             tqdm.write(f"  [warning] Could not fetch canonical name for TaxID {taxid}: {exc}",
                        file=sys.stderr)
             sci_name = name
+            lineage = name
 
-        resolved[name] = {"taxid": taxid, "scientific_name": sci_name}
+        resolved[name] = {"taxid": taxid, "scientific_name": sci_name, "lineage": lineage}
         tqdm.write(f"  {name!r} -> TaxID {taxid} ({sci_name})")
         time.sleep(0.34)
 
@@ -300,6 +310,37 @@ def trim_description(title: str, max_len: int = 120) -> str:
     """Keep only the first entry of a MULTISPECIES title and cap length."""
     first = title.split(" >")[0]
     return first if len(first) <= max_len else first[:max_len - 1] + "…"
+
+
+def extract_protein_name(title: str) -> str:
+    """
+    Strip the accession prefix from a BLAST title, returning only the protein
+    description.  Handles the common formats:
+      sp|P12345|PROT_BACSU Description [Organism]  -> Description [Organism]
+      gb|ABC123.1| Description [Organism]           -> Description [Organism]
+      pdb|2I5L|X chain A                            -> chain A
+      XP_123456.1 Description [Organism]            -> Description [Organism]
+    """
+    parts = title.split("|")
+    if len(parts) >= 3:
+        # db|accession|entry_name Description ...  (sp/pdb style)
+        # db|accession| Description ...            (gb style — leading space)
+        last = parts[-1]
+        if last.startswith(" "):
+            # gb style: no entry_name token, description follows the space directly
+            return last.strip()
+        # sp/pdb style: first token is entry_name, strip it
+        space_idx = last.find(" ")
+        if space_idx > 0:
+            return last[space_idx + 1:].strip()
+        return last.strip()
+    elif len(parts) == 2:
+        # e.g. "ref|XP_123.1|" with description in last segment
+        return parts[-1].strip()
+    else:
+        # plain accession: strip first whitespace-delimited token
+        space_idx = title.find(" ")
+        return title[space_idx + 1:].strip() if space_idx > 0 else title
 
 
 def safe_filename(s: str) -> str:
@@ -628,23 +669,25 @@ def process_taxonomy(
 # Hit-count matrix
 # ---------------------------------------------------------------------------
 
-def write_hit_counts(path: Path, counts: dict, query_ids: list, tax_names: list) -> None:
+def write_hit_counts(path: Path, counts: dict, query_ids: list, tax_names: list,
+                     lineages: dict) -> None:
     """Rewrite the hit-counts matrix TSV (rows = taxa, columns = queries)."""
     with open(path, "w", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t")
-        writer.writerow(["taxonomy"] + query_ids)
+        writer.writerow(["taxonomy", "lineage"] + query_ids)
         for tax in tax_names:
-            row = [tax] + [counts.get(tax, {}).get(qid, "") for qid in query_ids]
+            row = [tax, lineages.get(tax, "")] + [counts.get(tax, {}).get(qid, "") for qid in query_ids]
             writer.writerow(row)
 
 
-def write_median_identity(path: Path, medians: dict, query_ids: list, tax_names: list) -> None:
+def write_median_identity(path: Path, medians: dict, query_ids: list, tax_names: list,
+                          lineages: dict) -> None:
     """Rewrite the median-identity matrix TSV (rows = taxa, columns = queries)."""
     with open(path, "w", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t")
-        writer.writerow(["taxonomy"] + query_ids)
+        writer.writerow(["taxonomy", "lineage"] + query_ids)
         for tax in tax_names:
-            row = [tax] + [medians.get(tax, {}).get(qid, "") for qid in query_ids]
+            row = [tax, lineages.get(tax, "")] + [medians.get(tax, {}).get(qid, "") for qid in query_ids]
             writer.writerow(row)
 
 
@@ -671,13 +714,34 @@ def format_hit_stats(results: list) -> str:
     )
 
 
-def write_hit_stats(path: Path, stats: dict, query_ids: list, tax_names: list) -> None:
+def write_hit_stats(path: Path, stats: dict, query_ids: list, tax_names: list,
+                    lineages: dict) -> None:
     """Rewrite the hit-stats matrix TSV (rows = taxa, columns = queries)."""
     with open(path, "w", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t")
-        writer.writerow(["taxonomy"] + query_ids)
+        writer.writerow(["taxonomy", "lineage"] + query_ids)
         for tax in tax_names:
-            row = [tax] + [stats.get(tax, {}).get(qid, "") for qid in query_ids]
+            row = [tax, lineages.get(tax, "")] + [stats.get(tax, {}).get(qid, "") for qid in query_ids]
+            writer.writerow(row)
+
+
+def majority_name(results: list) -> str:
+    """Return the most common trimmed protein name among the selected hits."""
+    if not results:
+        return ""
+    names = [re.sub(r'\s*\[[^\]]*\]\s*$', '', extract_protein_name(trim_description(hit["title"]))).strip()
+             for hit, _ in results]
+    return collections.Counter(names).most_common(1)[0][0]
+
+
+def write_majority_name(path: Path, names: dict, query_ids: list, tax_names: list,
+                        lineages: dict) -> None:
+    """Rewrite the majority-name matrix TSV (rows = taxa, columns = queries)."""
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh, delimiter="\t")
+        writer.writerow(["taxonomy", "lineage"] + query_ids)
+        for tax in tax_names:
+            row = [tax, lineages.get(tax, "")] + [names.get(tax, {}).get(qid, "") for qid in query_ids]
             writer.writerow(row)
 
 
@@ -717,9 +781,11 @@ def main() -> None:
     resolved = resolve_taxonomies(args.taxonomies, args.max_retries, args.retry_delay)
 
     query_ids = [rec.id for rec in query_records]
+    lineages = {name: resolved[name]["lineage"] for name in args.taxonomies}
     hit_counts: dict = {tax: {} for tax in args.taxonomies}
     median_identity: dict = {tax: {} for tax in args.taxonomies}
     hit_stats: dict = {tax: {} for tax in args.taxonomies}
+    majority_names: dict = {tax: {} for tax in args.taxonomies}
 
     tsv_path = outdir / "summary.tsv"
     tsv_columns = [
@@ -746,6 +812,7 @@ def main() -> None:
     print(f"Hit counts    : {args.hit_counts or 'disabled'}")
     print(f"Median id     : {args.selected_hit_median_identity or 'disabled'}")
     print(f"Hit stats     : {args.selected_hit_stats or 'disabled'}")
+    print(f"Majority name : {args.selected_hit_majority_name or 'disabled'}")
     print()
 
     write_lock = threading.Lock()
@@ -857,7 +924,7 @@ def main() -> None:
                         hit_counts[tax_name][qid] = n_passing
                         if args.hit_counts:
                             write_hit_counts(
-                                Path(args.hit_counts), hit_counts, query_ids, args.taxonomies,
+                                Path(args.hit_counts), hit_counts, query_ids, args.taxonomies, lineages,
                             )
                         identities = [hit["identity"] for hit, _ in results]
                         if identities:
@@ -867,13 +934,19 @@ def main() -> None:
                         if args.selected_hit_median_identity:
                             write_median_identity(
                                 Path(args.selected_hit_median_identity),
-                                median_identity, query_ids, args.taxonomies,
+                                median_identity, query_ids, args.taxonomies, lineages,
                             )
                         hit_stats[tax_name][qid] = format_hit_stats(results)
                         if args.selected_hit_stats:
                             write_hit_stats(
                                 Path(args.selected_hit_stats),
-                                hit_stats, query_ids, args.taxonomies,
+                                hit_stats, query_ids, args.taxonomies, lineages,
+                            )
+                        majority_names[tax_name][qid] = majority_name(results)
+                        if args.selected_hit_majority_name:
+                            write_majority_name(
+                                Path(args.selected_hit_majority_name),
+                                majority_names, query_ids, args.taxonomies, lineages,
                             )
                         tqdm.write(f"  [{tax_name}] written {written} sequences -> {out_path}")
 
@@ -888,6 +961,8 @@ def main() -> None:
         print(f"Median identity written -> {args.selected_hit_median_identity}")
     if args.selected_hit_stats:
         print(f"Hit stats written -> {args.selected_hit_stats}")
+    if args.selected_hit_majority_name:
+        print(f"Majority names written -> {args.selected_hit_majority_name}")
     print("Done.")
 
 
