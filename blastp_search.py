@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026  Christian M. Zmasek
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 BLASTP search program with per-taxonomy search strategy.
 
@@ -31,10 +45,20 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-VERSION = "1.6.1"
+VERSION = "1.7.1"
+
+
+@dataclass
+class Hit:
+    accession: str
+    title: str
+    evalue: float
+    coverage: float
+    identity: float
 
 from Bio import Entrez, SeqIO
 from Bio.Blast import NCBIWWW, NCBIXML
@@ -163,6 +187,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-multispecies", action="store_true", default=False,
         help="Exclude hits whose title contains 'MULTISPECIES'",
+    )
+    p.add_argument(
+        "--exclude-taxonomies", nargs="+", metavar="NAME", default=[],
+        help="Taxonomy names to exclude from all BLAST searches, e.g. "
+             "--exclude-taxonomies Coronaviridae Flaviviridae",
     )
     if len(sys.argv) == 1:
         p.print_help()
@@ -297,9 +326,12 @@ def resolve_taxonomies(taxonomies: list[str], max_retries: int,
     return resolved
 
 
-def build_entrez_query(info: dict) -> str:
-    """Build a single-taxonomy Entrez query for BLAST."""
-    return f'"{info["scientific_name"]}"[Organism]'
+def build_entrez_query(info: dict, exclude_taxonomies: Optional[list] = None) -> str:
+    """Build a single-taxonomy Entrez query for BLAST, optionally excluding taxa."""
+    query = f'"{info["scientific_name"]}"[Organism]'
+    for name in (exclude_taxonomies or []):
+        query += f' NOT "{name}"[Organism]'
+    return query
 
 
 # ---------------------------------------------------------------------------
@@ -321,26 +353,20 @@ def extract_protein_name(title: str) -> str:
       pdb|2I5L|X chain A                            -> chain A
       XP_123456.1 Description [Organism]            -> Description [Organism]
     """
-    parts = title.split("|")
-    if len(parts) >= 3:
-        # db|accession|entry_name Description ...  (sp/pdb style)
-        # db|accession| Description ...            (gb style — leading space)
-        last = parts[-1]
-        if last.startswith(" "):
-            # gb style: no entry_name token, description follows the space directly
-            return last.strip()
-        # sp/pdb style: first token is entry_name, strip it
-        space_idx = last.find(" ")
-        if space_idx > 0:
-            return last[space_idx + 1:].strip()
-        return last.strip()
-    elif len(parts) == 2:
-        # e.g. "ref|XP_123.1|" with description in last segment
-        return parts[-1].strip()
-    else:
-        # plain accession: strip first whitespace-delimited token
-        space_idx = title.find(" ")
-        return title[space_idx + 1:].strip() if space_idx > 0 else title
+    parts = title.split("|", 2)
+    if len(parts) == 3:
+        rest = parts[2]
+        if rest.startswith(" "):
+            # gb style: description follows the pipe directly
+            return rest.strip()
+        # sp/pdb style: first token is entry_name, skip it
+        tokens = rest.split(" ", 1)
+        return tokens[1].strip() if len(tokens) > 1 else rest.strip()
+    if len(parts) == 2:
+        return parts[1].strip()
+    # plain accession: strip first whitespace-delimited token
+    _, _, description = title.partition(" ")
+    return description.strip()
 
 
 def safe_filename(s: str) -> str:
@@ -510,8 +536,7 @@ def filter_hits(blast_record, evalue_cutoff: float, coverage_cutoff: float,
     Coverage is computed from merged HSP intervals; E-value and identity
     are taken from the best (first) HSP.
     """
-    passing: list[dict] = []
-    seen: set[str] = set()
+    passing: dict[str, Hit] = {}
 
     for alignment in blast_record.alignments:
         if exclude_multispecies and "MULTISPECIES" in alignment.title:
@@ -531,19 +556,16 @@ def filter_hits(blast_record, evalue_cutoff: float, coverage_cutoff: float,
             continue
 
         acc = extract_accession(alignment.accession)
-        if acc in seen:
-            continue
-        seen.add(acc)
+        if acc not in passing:
+            passing[acc] = Hit(
+                accession=acc,
+                title=alignment.title,
+                evalue=best_hsp.expect,
+                coverage=round(cov, 1),
+                identity=round(identity_pct, 1),
+            )
 
-        passing.append({
-            "accession": acc,
-            "title": alignment.title,
-            "evalue": best_hsp.expect,
-            "coverage": round(cov, 1),
-            "identity": round(identity_pct, 1),
-        })
-
-    return passing
+    return list(passing.values())
 
 
 def fetch_sequences(accessions: list[str], max_retries: int, retry_delay: float,
@@ -605,6 +627,13 @@ def match_sequence(acc: str, sequences: dict):
 
 
 # ---------------------------------------------------------------------------
+def make_rng(tax: str, seed: Optional[int]) -> random.Random:
+    """Return a per-taxonomy RNG seeded deterministically when seed is given."""
+    if seed is None:
+        return random.Random()
+    return random.Random(seed ^ (hash(tax) & 0xFFFFFFFF))
+
+
 # Per-(query, taxonomy) worker
 # ---------------------------------------------------------------------------
 
@@ -622,7 +651,7 @@ def process_taxonomy(
     n_passing is the count of hits passing all filters (before random draw).
     Called from worker threads.
     """
-    entrez_q = build_entrez_query(tax_info)
+    entrez_q = build_entrez_query(tax_info, args.exclude_taxonomies)
     qlen = len(qrec.seq)
 
     jitter = rng.uniform(2.0, 5.0)
@@ -658,10 +687,10 @@ def process_taxonomy(
     tqdm.write(f"  [{tax_name}] selected: {len(selected)}")
 
     sequences = fetch_sequences(
-        [h["accession"] for h in selected], args.max_retries, args.retry_delay,
+        [h.accession for h in selected], args.max_retries, args.retry_delay,
     )
 
-    results = [(hit, match_sequence(hit["accession"], sequences)) for hit in selected]
+    results = [(hit, match_sequence(hit.accession, sequences)) for hit in selected]
     return tax_name, results, len(passing)
 
 
@@ -669,25 +698,14 @@ def process_taxonomy(
 # Hit-count matrix
 # ---------------------------------------------------------------------------
 
-def write_hit_counts(path: Path, counts: dict, query_ids: list, tax_names: list,
+def write_tsv_matrix(path: Path, data: dict, query_ids: list, tax_names: list,
                      lineages: dict) -> None:
-    """Rewrite the hit-counts matrix TSV (rows = taxa, columns = queries)."""
+    """Rewrite a TSV matrix (rows = taxa, columns = queries)."""
     with open(path, "w", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t")
         writer.writerow(["taxonomy", "lineage"] + query_ids)
         for tax in tax_names:
-            row = [tax, lineages.get(tax, "")] + [counts.get(tax, {}).get(qid, "") for qid in query_ids]
-            writer.writerow(row)
-
-
-def write_median_identity(path: Path, medians: dict, query_ids: list, tax_names: list,
-                          lineages: dict) -> None:
-    """Rewrite the median-identity matrix TSV (rows = taxa, columns = queries)."""
-    with open(path, "w", newline="") as fh:
-        writer = csv.writer(fh, delimiter="\t")
-        writer.writerow(["taxonomy", "lineage"] + query_ids)
-        for tax in tax_names:
-            row = [tax, lineages.get(tax, "")] + [medians.get(tax, {}).get(qid, "") for qid in query_ids]
+            row = [tax, lineages.get(tax, "")] + [data.get(tax, {}).get(qid, "") for qid in query_ids]
             writer.writerow(row)
 
 
@@ -698,14 +716,14 @@ def format_hit_stats(results: list) -> str:
     """
     if not results:
         return "n=0"
-    evalues   = [hit["evalue"]   for hit, _ in results]
-    ids       = [hit["identity"] for hit, _ in results]
-    coverages = [hit["coverage"] for hit, _ in results]
+    evalues   = [hit.evalue   for hit, _ in results]
+    ids       = [hit.identity for hit, _ in results]
+    coverages = [hit.coverage for hit, _ in results]
     e_min, e_max     = min(evalues),   max(evalues)
     id_min, id_max   = min(ids),       max(ids)
     cov_min, cov_max = min(coverages), max(coverages)
-    id_median = round(statistics.median(ids),       1)
-    cov_mean  = round(sum(coverages) / len(coverages), 1)
+    id_median = round(statistics.median(ids),  1)
+    cov_mean  = round(statistics.mean(coverages), 1)
     return (
         f"n={len(results)} "
         f"E:{e_min:.1e}\u2013{e_max:.1e} "
@@ -714,35 +732,17 @@ def format_hit_stats(results: list) -> str:
     )
 
 
-def write_hit_stats(path: Path, stats: dict, query_ids: list, tax_names: list,
-                    lineages: dict) -> None:
-    """Rewrite the hit-stats matrix TSV (rows = taxa, columns = queries)."""
-    with open(path, "w", newline="") as fh:
-        writer = csv.writer(fh, delimiter="\t")
-        writer.writerow(["taxonomy", "lineage"] + query_ids)
-        for tax in tax_names:
-            row = [tax, lineages.get(tax, "")] + [stats.get(tax, {}).get(qid, "") for qid in query_ids]
-            writer.writerow(row)
 
 
 def majority_name(results: list) -> str:
     """Return the most common trimmed protein name among the selected hits."""
     if not results:
         return ""
-    names = [re.sub(r'\s*\[[^\]]*\]\s*$', '', extract_protein_name(trim_description(hit["title"]))).strip()
+    names = [re.sub(r'\s*\[[^\]]*\]\s*$', '', extract_protein_name(trim_description(hit.title))).strip()
              for hit, _ in results]
     return collections.Counter(names).most_common(1)[0][0]
 
 
-def write_majority_name(path: Path, names: dict, query_ids: list, tax_names: list,
-                        lineages: dict) -> None:
-    """Rewrite the majority-name matrix TSV (rows = taxa, columns = queries)."""
-    with open(path, "w", newline="") as fh:
-        writer = csv.writer(fh, delimiter="\t")
-        writer.writerow(["taxonomy", "lineage"] + query_ids)
-        for tax in tax_names:
-            row = [tax, lineages.get(tax, "")] + [names.get(tax, {}).get(qid, "") for qid in query_ids]
-            writer.writerow(row)
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +780,11 @@ def main() -> None:
     # Resolve taxonomy names to TaxIDs and canonical names
     resolved = resolve_taxonomies(args.taxonomies, args.max_retries, args.retry_delay)
 
+    hit_counts_path      = Path(args.hit_counts)                    if args.hit_counts                    else None
+    median_identity_path = Path(args.selected_hit_median_identity)  if args.selected_hit_median_identity  else None
+    hit_stats_path       = Path(args.selected_hit_stats)            if args.selected_hit_stats            else None
+    majority_name_path   = Path(args.selected_hit_majority_name)    if args.selected_hit_majority_name    else None
+
     query_ids = [rec.id for rec in query_records]
     lineages = {name: resolved[name]["lineage"] for name in args.taxonomies}
     hit_counts: dict = {tax: {} for tax in args.taxonomies}
@@ -805,6 +810,8 @@ def main() -> None:
     print(f"E-value       : {args.evalue}")
     print(f"Coverage      : {args.coverage}%")
     print(f"Identity      : {args.identity}%")
+    if args.exclude_taxonomies:
+        print(f"Excluding     : {', '.join(args.exclude_taxonomies)}")
     print(f"Max seqs/tax  : {args.max_seqs}")
     print(f"BLAST pool    : {args.hitlist_size} hits per search")
     print(f"Output dir    : {outdir}")
@@ -844,20 +851,13 @@ def main() -> None:
 
             out_path = outdir / f"{safe_filename(qid)}.fasta"
 
-            # Build per-taxonomy RNGs so parallel draws are independent but
-            # deterministic when --seed is given
-            def make_rng(tax: str) -> random.Random:
-                if base_seed is None:
-                    return random.Random()
-                return random.Random(base_seed ^ (hash(tax) & 0xFFFFFFFF))
-
             n_workers = min(args.workers, len(pending_taxes))
             with ThreadPoolExecutor(max_workers=n_workers) as executor:
                 futures = {
                     executor.submit(
                         process_taxonomy,
                         qrec, tax_name, resolved[tax_name],
-                        args, cache_dir, make_rng(tax_name),
+                        args, cache_dir, make_rng(tax_name, base_seed),
                     ): tax_name
                     for tax_name in pending_taxes
                 }
@@ -886,68 +886,54 @@ def main() -> None:
                             for hit, rec in results:
                                 if rec is None:
                                     tqdm.write(
-                                        f"  [warning] Sequence not fetched: {hit['accession']}",
+                                        f"  [warning] Sequence not fetched: {hit.accession}",
                                         file=sys.stderr,
                                     )
                                     writer.writerow({
                                         "query_id": qid,
                                         "query_length": qlen,
                                         "taxonomy": tax_name,
-                                        "accession": hit["accession"],
-                                        "description": trim_description(hit["title"]),
-                                        "evalue": f"{hit['evalue']:.2e}",
-                                        "identity_pct": hit["identity"],
-                                        "query_coverage_pct": hit["coverage"],
+                                        "accession": hit.accession,
+                                        "description": trim_description(hit.title),
+                                        "evalue": f"{hit.evalue:.2e}",
+                                        "identity_pct": hit.identity,
+                                        "query_coverage_pct": hit.coverage,
                                         "output_fasta": "NOT_FETCHED",
                                     })
                                     continue
                                 rec.description = (
-                                    f"evalue={hit['evalue']:.2e} "
-                                    f"id={hit['identity']}% "
-                                    f"qcov={hit['coverage']}% | {rec.description}"
+                                    f"evalue={hit.evalue:.2e} "
+                                    f"id={hit.identity}% "
+                                    f"qcov={hit.coverage}% | {rec.description}"
                                 )
                                 SeqIO.write(rec, fh, "fasta")
                                 writer.writerow({
                                     "query_id": qid,
                                     "query_length": qlen,
                                     "taxonomy": tax_name,
-                                    "accession": hit["accession"],
-                                    "description": trim_description(hit["title"]),
-                                    "evalue": f"{hit['evalue']:.2e}",
-                                    "identity_pct": hit["identity"],
-                                    "query_coverage_pct": hit["coverage"],
+                                    "accession": hit.accession,
+                                    "description": trim_description(hit.title),
+                                    "evalue": f"{hit.evalue:.2e}",
+                                    "identity_pct": hit.identity,
+                                    "query_coverage_pct": hit.coverage,
                                     "output_fasta": str(out_path),
                                 })
                                 written += 1
                         tsv_fh.flush()
                         save_checkpoint(checkpoint_path, checkpoint_key)
                         hit_counts[tax_name][qid] = n_passing
-                        if args.hit_counts:
-                            write_hit_counts(
-                                Path(args.hit_counts), hit_counts, query_ids, args.taxonomies, lineages,
-                            )
-                        identities = [hit["identity"] for hit, _ in results]
-                        if identities:
-                            median_identity[tax_name][qid] = round(statistics.median(identities), 1)
-                        else:
-                            median_identity[tax_name][qid] = 0
-                        if args.selected_hit_median_identity:
-                            write_median_identity(
-                                Path(args.selected_hit_median_identity),
-                                median_identity, query_ids, args.taxonomies, lineages,
-                            )
+                        if hit_counts_path:
+                            write_tsv_matrix(hit_counts_path, hit_counts, query_ids, args.taxonomies, lineages)
+                        identities = [hit.identity for hit, _ in results]
+                        median_identity[tax_name][qid] = round(statistics.median(identities), 1) if identities else 0
+                        if median_identity_path:
+                            write_tsv_matrix(median_identity_path, median_identity, query_ids, args.taxonomies, lineages)
                         hit_stats[tax_name][qid] = format_hit_stats(results)
-                        if args.selected_hit_stats:
-                            write_hit_stats(
-                                Path(args.selected_hit_stats),
-                                hit_stats, query_ids, args.taxonomies, lineages,
-                            )
+                        if hit_stats_path:
+                            write_tsv_matrix(hit_stats_path, hit_stats, query_ids, args.taxonomies, lineages)
                         majority_names[tax_name][qid] = majority_name(results)
-                        if args.selected_hit_majority_name:
-                            write_majority_name(
-                                Path(args.selected_hit_majority_name),
-                                majority_names, query_ids, args.taxonomies, lineages,
-                            )
+                        if majority_name_path:
+                            write_tsv_matrix(majority_name_path, majority_names, query_ids, args.taxonomies, lineages)
                         tqdm.write(f"  [{tax_name}] written {written} sequences -> {out_path}")
 
                     tax_bar.update(1)
@@ -955,14 +941,14 @@ def main() -> None:
                 tax_bar.close()
 
     print(f"\nSummary written -> {tsv_path}")
-    if args.hit_counts:
-        print(f"Hit counts written -> {args.hit_counts}")
-    if args.selected_hit_median_identity:
-        print(f"Median identity written -> {args.selected_hit_median_identity}")
-    if args.selected_hit_stats:
-        print(f"Hit stats written -> {args.selected_hit_stats}")
-    if args.selected_hit_majority_name:
-        print(f"Majority names written -> {args.selected_hit_majority_name}")
+    if hit_counts_path:
+        print(f"Hit counts written -> {hit_counts_path}")
+    if median_identity_path:
+        print(f"Median identity written -> {median_identity_path}")
+    if hit_stats_path:
+        print(f"Hit stats written -> {hit_stats_path}")
+    if majority_name_path:
+        print(f"Majority names written -> {majority_name_path}")
     print("Done.")
 
 
